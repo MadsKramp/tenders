@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+
+# Virtual environments
+.env
+.venv
+venv/
+env/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Data files
+*.csv
+*.xlsx
+*.xls
+*.parquet
+*.pkl
+*.pickle
+
+# BigQuery credentials
+credentials.json
+service-account-key.json
+gcloud-service-key.json
+
+# Configuration files
+config.ini
+config.yaml
+config.yml
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+temp/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Output files
+*.png
+*.jpg
+*.pdf
+*.svg
+output/
+plots/
+figures/
+
+# IDE
+.vscode/
+.idea/
