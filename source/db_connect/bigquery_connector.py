@@ -44,32 +44,32 @@ def check_dependencies():
     
     try:
         import db_dtypes
-        performance_info.append("✓ db-dtypes: Enhanced BigQuery data type handling")
+        performance_info.append("OK db-dtypes: Enhanced BigQuery data type handling")
     except ImportError:
         missing_deps.append("db-dtypes")
-        performance_info.append("✗ db-dtypes: Missing - BigQuery data types may not convert properly")
+        performance_info.append("MISSING db-dtypes: BigQuery data types may not convert properly")
     
     try:
         import pyarrow
-        performance_info.append("✓ PyArrow: Fast data conversion (10-100x faster for large datasets)")
+        performance_info.append("OK PyArrow: Fast data conversion (10-100x faster for large datasets)")
     except ImportError:
         missing_deps.append("pyarrow")
-        performance_info.append("✗ PyArrow: Missing - Conversion will be significantly slower for large datasets")
+        performance_info.append("MISSING PyArrow: Conversion will be significantly slower for large datasets")
     
     # Always show performance status
-    print("📊 Performance Dependencies Status:")
+    print("Performance Dependencies Status:")
     for info in performance_info:
         print(f"   {info}")
     
     if missing_deps:
         deps_str = ", ".join(missing_deps)
-        print(f"\n⚠️ Install missing dependencies for better performance:")
+        print(f"\nWARNING: Install missing dependencies for better performance:")
         print(f"   pip install {deps_str}")
         if "pyarrow" in missing_deps:
-            print(f"   ⭐ PyArrow is especially important for large datasets!")
+            print(f"   NOTE: PyArrow is especially important for large datasets!")
         print()
     else:
-        print(f"✓ All performance dependencies are installed!\n")
+        print(f"All performance dependencies are installed!\n")
     
     return len(missing_deps) == 0
 

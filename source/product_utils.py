@@ -26,7 +26,10 @@ import numpy as np
 import pandas as pd
 
 # ---- BigQuery delegation (use your connector) --------------------------------
-from bigquery_connector import select_df as _bq_select_df, DEFAULT_FQN, ALT_VIEW_FQN  # type: ignore
+try:
+    from source.db_connect.bigquery_connector import select_df as _bq_select_df, DEFAULT_FQN, ALT_VIEW_FQN
+except ImportError:
+    from db_connect.bigquery_connector import select_df as _bq_select_df, DEFAULT_FQN, ALT_VIEW_FQN  # type: ignore
 
 # ---- Public API --------------------------------------------------------------
 __all__ = [
