@@ -6,7 +6,7 @@ Utilities for clustering tender-material products using TWO numeric features:
   1) purchase_amount_eur_total  (sum: purchase_amount_eur_2020..2024)
   2) quantity_sold_total        (sum: quantity_sold_2021..2024)
 
-Data source (EU): params.TENDER_MATERIAL_FQN
+Data source (EU): params.SUPER_TABLE_FQN
 Filters honored (SQL-side): class_2/3/4, brand_name, STEP_CountryOfOrigin, supplier_name_string,
                             item_number, keyword_in_desc; purchase-stop policy.
 
@@ -33,10 +33,13 @@ from sklearn.metrics import silhouette_score, calinski_harabasz_score
 # Config / params
 # -----------------------------------------------------------------------------
 try:
-    # If this module lives in the same package as your params
-    from . import tender_material_params as params  # type: ignore
-except Exception:
-    import tender_material_params as params  # type: ignore
+    # Prefer the unified clustering_params module (authoritative configuration)
+    from . import clustering_params as params  # type: ignore
+except Exception:  # pragma: no cover - fallback if relative import fails
+    try:
+        import clustering_params as params  # type: ignore
+    except Exception as _e:  # final fallback with explicit error
+        raise ImportError("Unable to import clustering_params; ensure file 'clustering_params.py' exists in 'source/data_processing'.") from _e
 
 # -----------------------------------------------------------------------------
 # BigQuery connector
@@ -88,7 +91,7 @@ def _fmt_in(values: Sequence[str]) -> str:
 
 
 def _where_clause() -> str:
-    """Build WHERE clause from tender_material_params filters."""
+    """Build WHERE clause from super_table_params filters."""
     where = []
 
     mode = (params.PURCHASE_STOP_MODE or "").strip().lower()
@@ -128,7 +131,7 @@ def _build_sql(columns: Optional[Sequence[str]] = None, limit: Optional[int] = N
     sql = f"""
 SELECT
     {select_list}
-FROM {params.TENDER_MATERIAL_FQN}
+FROM {params.SUPER_TABLE_FQN}
 {_where_clause()}
 """
     if limit and isinstance(limit, int) and limit > 0:
@@ -156,14 +159,14 @@ def _coerce_numeric(df: pd.DataFrame, cols: Sequence[str]) -> pd.DataFrame:
 # Data fetch & feature preparation
 # =============================================================================
 
-def fetch_tender_material(
+def fetch_super_table(
     *,
     columns: Optional[Sequence[str]] = None,
     limit: Optional[int] = params.ROW_LIMIT,
     debug_print_sql: bool = False,
 ) -> pd.DataFrame:
     """
-    Fetch filtered rows from tender_material with EU location.
+    Fetch filtered rows from super_table with EU location.
     """
     sql = _build_sql(columns=columns, limit=limit)
     if debug_print_sql:

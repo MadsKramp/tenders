@@ -26,10 +26,16 @@ import numpy as np
 import pandas as pd
 
 # ---- BigQuery delegation (use your connector) --------------------------------
+# Prefer relative import within the 'source' package; fall back to absolute.
 try:
-    from source.db_connect.bigquery_connector import select_df as _bq_select_df, DEFAULT_FQN, ALT_VIEW_FQN
+    from ..db_connect.bigquery_connector import select_df as _bq_select_df, DEFAULT_FQN, ALT_VIEW_FQN
 except ImportError:
-    from db_connect.bigquery_connector import select_df as _bq_select_df, DEFAULT_FQN, ALT_VIEW_FQN  # type: ignore
+    try:
+        from source.db_connect.bigquery_connector import select_df as _bq_select_df, DEFAULT_FQN, ALT_VIEW_FQN  # type: ignore
+    except ImportError as e:
+        raise ImportError(
+            "Unable to import BigQueryConnector. Ensure 'source/db_connect' is a package and accessible."
+        ) from e
 
 # ---- Public API --------------------------------------------------------------
 __all__ = [

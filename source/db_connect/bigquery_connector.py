@@ -97,8 +97,17 @@ class BigQueryConnector:
         try:
             print(f"🔧 Initializing BigQuery connector...")
             
-            self.project_id = project_id or os.getenv('PROJECT_ID')
-            print(self.project_id )
+            # PROJECT_ID env var should hold a plain GCP project id (e.g. 'kramp-sharedmasterdata-prd').
+            # Guard against accidental assignment of a table/view FQN.
+            raw_project = project_id or os.getenv('PROJECT_ID')
+            if raw_project and '.' in raw_project:
+                # Heuristic: if contains dots typical of dataset.table path, take first segment as project id.
+                candidate = raw_project.split('.')[0]
+                print(f"[BigQueryConnector] Detected compound project string; using '{candidate}' as project id.")
+                self.project_id = candidate
+            else:
+                self.project_id = raw_project
+            print(self.project_id)
             self.credentials_path = credentials_path or os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
             
             print(f"   Project ID: {self.project_id}")
@@ -552,7 +561,8 @@ def quick_query(sql: str, project_id: Optional[str] = None, use_fast_conversion:
     try:
         print(f"🚀 Quick query execution...")
         bq = BigQueryConnector(project_id=project_id)
-        return bq.query(sql, use_fast_conversion=use_fast_conversion)
+        # use_fast_conversion kept for API compatibility; actual conversion handled internally.
+        return bq.query(sql)
     except Exception as e:
         print(f"✗ Error in quick_query: {e}")
         return None
@@ -579,5 +589,31 @@ def get_kramp_fasteners_data(limit: int = 1000) -> Optional[pd.DataFrame]:
     except Exception as e:
         print(f"✗ Error in get_kramp_fasteners_data: {e}")
         return None
+
+
+# -----------------------------------------------------------------------------
+# Additional convenience expected by product_utils
+# -----------------------------------------------------------------------------
+DEFAULT_FQN = "kramp-sharedmasterdata-prd.MadsH.super_table"
+ALT_VIEW_FQN = "kramp-sharedmasterdata-prd.MadsH.super_table_alt_view"
+
+def select_df(sql: str, project_id: Optional[str] = None) -> pd.DataFrame:
+    """Light wrapper returning a DataFrame for the given SQL.
+
+    Parameters
+    ----------
+    sql : str
+        Standard BigQuery SQL query.
+    project_id : Optional[str]
+        Override GCP project id; falls back to env / constructor defaults.
+    """
+    bq = BigQueryConnector(project_id=project_id)
+    df = bq.query(sql)
+    return df if df is not None else pd.DataFrame()
+
+__all__ = [
+    'BigQueryConnector', 'quick_query', 'get_kramp_fasteners_data',
+    'select_df', 'DEFAULT_FQN', 'ALT_VIEW_FQN'
+]
 
 

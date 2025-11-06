@@ -1,7 +1,7 @@
 """
-tender_material_utils.py — Utilities for the MadsH.tender_material table (EU)
+super_table_utils.py — Utilities for the MadsH.super_table table (EU)
 
-- BigQuery fetches from: kramp-sharedmasterdata-prd.MadsH.tender_material
+- BigQuery fetches from: kramp-sharedmasterdata-prd.MadsH.super_table
 - Optional filters: Class2, Class3, Class4, BrandName, CountryOfOrigin, GroupSupplier
 - Purchase-stop filtering: strict (stop_purchase_ind='N'),
   lenient (stop_purchase_ind!='Y' OR NULLs), or off.
@@ -29,7 +29,7 @@ from source.db_connect import BigQueryConnector
 # Optional: use your dataframe-side helpers when you already have a DF loaded
 # (not required for SQL-side filtering, but nice to keep parity with the notebook)
 try:
-    from product_utils import (
+    from source.data_processing.product_utils import (
         filter_by_class2,
         filter_by_class3,
         filter_by_class4,
@@ -53,9 +53,9 @@ load_dotenv()
 
 PROJECT_ID = os.getenv("PROJECT_ID", "kramp-sharedmasterdata-prd")
 DATASET_ID = os.getenv("DATASET_ID", "MadsH")  # <- you asked to use MadsH
-TABLE_ID   = os.getenv("TABLE_ID", "tender_material")
+TABLE_ID   = os.getenv("TABLE_ID", "super_table")
 
-TENDER_MATERIAL_FQN = f"`{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`"
+SUPER_TABLE_FQN = f"`{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`"
 
 # Core product columns to include (as per your “only include” list)
 PRODUCT_COLS: list[str] = [
@@ -117,7 +117,7 @@ PRODUCT_COLS: list[str] = [
     "STEP_CountryOfOrigin",                 # <- added from CMQ__ItemSupplierData__Combined_v5
 ]
 
-# Attribute columns that exist row-wise in tender_material (joined from Ciske)
+# Attribute columns that exist row-wise in super_table (joined from Ciske)
 ATTRIBUTE_COLS: list[str] = [
     "attribute_id",
     "attribute_description",
@@ -133,6 +133,52 @@ ATTRIBUTE_COLS: list[str] = [
 ]
 
 DEFAULT_COLUMNS = PRODUCT_COLS + ATTRIBUTE_COLS
+
+# -----------------------------------------------------------------------------
+# Yearly column groupings & helper constant sets (cross-script alignment)
+# -----------------------------------------------------------------------------
+# The super_table table exposes purchase_amount_eur_YYYY (2020..2024 currently) and
+# quantity_sold_YYYY (2021..2024). Separate purchase vs sales quantity naming used in
+# purchase & supplier scripts (purchase_quantity_YYYY). We keep flexible groups below.
+
+PURCHASE_AMOUNT_YEAR_COLS: list[str] = [
+    # Dynamic growth: include 2020..2025 if present. These appear in pivoted purchase/supplier tables.
+    "purchase_amount_eur_2020",
+    "purchase_amount_eur_2021",
+    "purchase_amount_eur_2022",
+    "purchase_amount_eur_2023",
+    "purchase_amount_eur_2024",
+    "purchase_amount_eur_2025",
+]
+
+SALES_QUANTITY_YEAR_COLS: list[str] = [
+    "quantity_sold_2021",
+    "quantity_sold_2022",
+    "quantity_sold_2023",
+    "quantity_sold_2024",
+]
+
+PURCHASE_QUANTITY_YEAR_COLS: list[str] = [
+    # Naming used in create_purchase_data.sql & create_supplier_data.sql (pivot outcome)
+    "purchase_quantity_2020",
+    "purchase_quantity_2021",
+    "purchase_quantity_2022",
+    "purchase_quantity_2023",
+    "purchase_quantity_2024",
+    "purchase_quantity_2025",
+]
+
+ORDERS_YEAR_COLS: list[str] = [
+    "orders_2021", "orders_2022", "orders_2023", "orders_2024",
+]
+
+# Public lookups for external code (import from package __init__ already exports DEFAULT_COLUMNS)
+YEAR_COLUMN_GROUPS: dict[str, list[str]] = {
+    "purchase_amount": PURCHASE_AMOUNT_YEAR_COLS,
+    "sales_quantity": SALES_QUANTITY_YEAR_COLS,
+    "purchase_quantity": PURCHASE_QUANTITY_YEAR_COLS,
+    "orders": ORDERS_YEAR_COLS,
+}
 
 # -----------------------------------------------------------------------------
 # Small SQL helpers
@@ -152,11 +198,51 @@ def _in_clause(col: str, values: Optional[Iterable[str]]) -> Optional[str]:
     return f"{col} IN ({_sql_quote(vals)})"
 
 def _like_any_clause(col: str, values: Optional[Iterable[str]]) -> Optional[str]:
-    """Case-insensitive LIKE ANY helper (for keyword lists)."""
+    """Case-insensitive LIKE ANY helper (for keyword lists).
+
+    Builds OR'ed LIKE clauses, skipping empty/blank keywords and properly escaping single quotes.
+    Uses LOWER() on both sides for CI matching.
+    """
     if not values:
         return None
-    frags = [f"LOWER({col}) LIKE '%' || LOWER({_sql_quote([v])[0]}) || '%'" for v in values]
+    frags: list[str] = []
+    for raw in values:
+        v = (raw or "").strip()
+        if not v:
+            continue
+        safe = v.replace("'", "''")  # basic quote escape
+        frags.append(f"LOWER({col}) LIKE '%{safe.lower()}%'")
     return "(" + " OR ".join(frags) + ")" if frags else None
+
+import re
+def _regex_any_clause(col: str, values: Optional[Iterable[str]], *, whole_word: bool = True) -> Optional[str]:
+    """Regex OR helper using BigQuery REGEXP_CONTAINS.
+
+    Parameters
+    ----------
+    col : str
+        Column name to search.
+    values : iterable of str
+        Keywords/phrases. Escaped for literal matching.
+    whole_word : bool
+        If True wrap each term with \b word boundaries.
+    """
+    if not values:
+        return None
+    parts: list[str] = []
+    for raw in values:
+        v = (raw or "").strip()
+        if not v:
+            continue
+        esc = re.escape(v.lower())
+        if whole_word:
+            esc = r"\b" + esc + r"\b"
+        parts.append(esc)
+    if not parts:
+        return None
+    pattern = "|".join(parts)
+    # (?i) inline for case-insensitive; keep original column (no LOWER needed)
+    return f"REGEXP_CONTAINS({col}, r'(?i){pattern}')"
 
 def _purchase_stop_clause(mode: Optional[str]) -> Optional[str]:
     """
@@ -176,7 +262,7 @@ def _purchase_stop_clause(mode: Optional[str]) -> Optional[str]:
 # -----------------------------------------------------------------------------
 # Public API
 # -----------------------------------------------------------------------------
-def fetch_tender_material(
+def fetch_super_table(
     *,
     columns: Optional[Sequence[str]] = None,
     class2: Optional[Sequence[str]] = None,
@@ -187,13 +273,15 @@ def fetch_tender_material(
     group_supplier: Optional[Sequence[str]] = None,      # supplier_name_string
     item_numbers: Optional[Sequence[str]] = None,        # item_number filter
     attribute_ids: Optional[Sequence[str]] = None,       # attribute_id filter
-    keyword_in_desc: Optional[Sequence[str]] = None,     # LIKE filter on item_description
+    keyword_in_desc: Optional[Sequence[str]] = None,     # keyword filter on item_description
+    keyword_mode: str = "like",                         # 'like' | 'regex'
+    regex_whole_word: bool = True,                      # applies if keyword_mode='regex'
     purchase_stop: Optional[str] = "strict",             # 'strict'|'lenient'|None
     limit: Optional[int] = None,
     debug_print_sql: bool = False,
 ) -> pd.DataFrame:
     """
-    Pull rows from MadsH.tender_material with flexible SQL-side filtering.
+    Pull rows from MadsH.super_table with flexible SQL-side filtering.
 
     Returns
     -------
@@ -216,9 +304,13 @@ def fetch_tender_material(
 
     # LIKE on item_description (keywords)
     if keyword_in_desc:
-        like_clause = _like_any_clause("item_description", keyword_in_desc)
-        if like_clause:
-            where_parts.append(like_clause)
+        km = (keyword_mode or "like").strip().lower()
+        if km == "regex":
+            kw_clause = _regex_any_clause("item_description", keyword_in_desc, whole_word=regex_whole_word)
+        else:
+            kw_clause = _like_any_clause("item_description", keyword_in_desc)
+        if kw_clause:
+            where_parts.append(kw_clause)
 
     # Purchase-stop policy
     ps = _purchase_stop_clause(purchase_stop)
@@ -229,15 +321,15 @@ def fetch_tender_material(
     if where_parts:
         where_sql = "WHERE " + "\n  AND ".join([w for w in where_parts if w])
 
-    limit_sql = f"LIMIT {int(limit)}" if (isinstance(limit, int) and limit > 0) else ""
+        limit_sql = f"LIMIT {int(limit)}" if (isinstance(limit, int) and limit > 0) else ""
 
-    query = f"""
-    SELECT
-      {select_cols}
-    FROM {TENDER_MATERIAL_FQN}
-    {where_sql}
-    {limit_sql}
-    """.strip()
+        query = f"""
+        SELECT
+            {select_cols}
+        FROM {SUPER_TABLE_FQN}
+        {where_sql}
+        {limit_sql}
+        """.strip()
 
     if debug_print_sql:
         print("=== SQL ===")
@@ -252,6 +344,45 @@ def fetch_tender_material(
     if coerce_dtypes:
         df = coerce_dtypes(df)
     return df
+
+
+def fetch_super_table_for_clustering(
+    *,
+    class2: Optional[Sequence[str]] = None,
+    class3: Optional[Sequence[str]] = None,
+    class4: Optional[Sequence[str]] = None,
+    brand_name: Optional[Sequence[str]] = None,
+    purchase_stop: Optional[str] = "strict",
+    limit: Optional[int] = None,
+    debug_print_sql: bool = False,
+) -> pd.DataFrame:
+    """Minimal fetch tailored for clustering pipeline.
+
+    Retrieves only the columns required for deriving the two clustering features
+    (purchase amount total & quantity sold total) plus basic identifiers & filters.
+
+    Returns
+    -------
+    pd.DataFrame
+    """
+    base_cols = [
+        "item_number", "item_description", "class_2", "class_3", "class_4",
+        "brand_name", "STEP_CountryOfOrigin", "supplier_name_string", "stop_purchase_ind",
+    ]
+    # Only include year columns that exist (avoid selecting non-existent future years)
+    year_amount_cols = [c for c in PURCHASE_AMOUNT_YEAR_COLS if c in PRODUCT_COLS]
+    year_qty_cols = [c for c in SALES_QUANTITY_YEAR_COLS if c in PRODUCT_COLS]
+    cols = [c for c in base_cols + year_amount_cols + year_qty_cols if c in PRODUCT_COLS]
+    return fetch_super_table(
+        columns=cols,
+        class2=class2,
+        class3=class3,
+        class4=class4,
+        brand_name=brand_name,
+        purchase_stop=purchase_stop,
+        limit=limit,
+        debug_print_sql=debug_print_sql,
+    )
 
 
 def pivot_attributes_wide(
@@ -289,6 +420,157 @@ def pivot_attributes_wide(
     return wide
 
 
+def compute_totals(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute aggregate total columns if their components exist.
+
+    Adds columns:
+      - purchase_amount_eur_total
+      - quantity_sold_total
+      - purchase_quantity_total
+      - orders_total
+
+    Only sums across columns present in the DataFrame (safe on partial subsets).
+    """
+    work = df.copy()
+
+    def _sum_cols(cols: list[str]) -> pd.Series:
+        real = [c for c in cols if c in work.columns]
+        if not real:
+            return pd.Series([0] * len(work), index=work.index)
+        return work[real].apply(pd.to_numeric, errors="coerce").fillna(0).sum(axis=1)
+
+    if any(c in work.columns for c in PURCHASE_AMOUNT_YEAR_COLS):
+        work["purchase_amount_eur_total"] = _sum_cols(PURCHASE_AMOUNT_YEAR_COLS)
+    if any(c in work.columns for c in SALES_QUANTITY_YEAR_COLS):
+        work["quantity_sold_total"] = _sum_cols(SALES_QUANTITY_YEAR_COLS)
+    if any(c in work.columns for c in PURCHASE_QUANTITY_YEAR_COLS):
+        work["purchase_quantity_total"] = _sum_cols(PURCHASE_QUANTITY_YEAR_COLS)
+    if any(c in work.columns for c in ORDERS_YEAR_COLS):
+        work["orders_total"] = _sum_cols(ORDERS_YEAR_COLS)
+    return work
+
+
+def summarize_super_table(df: pd.DataFrame) -> dict:
+    """Quick numeric summary of super_table style DataFrame.
+
+    Returns a dictionary with sums of year columns & counts to assist diagnostics.
+    """
+    out = {}
+    for group_name, cols in YEAR_COLUMN_GROUPS.items():
+        present = [c for c in cols if c in df.columns]
+        if present:
+            # Sum numeric safely (2D: sum each column then total) for clarity
+            year_sum = df[present].apply(pd.to_numeric, errors="coerce").fillna(0).sum().sum()
+            out[f"{group_name}_year_cols_present"] = present
+            out[f"{group_name}_year_total_sum"] = float(year_sum)
+            out[f"{group_name}_nonzero_rows"] = int((df[present].apply(pd.to_numeric, errors="coerce").fillna(0).sum(axis=1) > 0).sum())
+            out[f"{group_name}_max_single_year"] = float(df[present].apply(pd.to_numeric, errors="coerce").fillna(0).max().max())
+    out["row_count"] = int(len(df))
+    return out
+
+
+def build_year_metrics_if_missing(
+    df: pd.DataFrame,
+    *,
+    id_col: str = "item_number",
+    year_col: str = "YearNumber",
+    turnover_col: str = "TurnoverEuro",
+    quantity_col: str = "QuantitySold",
+    margin_col: str = "MarginEuro",
+    list_price_turnover_col: str = "ListPriceTurnoverEuro",
+    create_orders: bool = True,
+) -> pd.DataFrame:
+    """Derive wide year-suffixed metric columns from transactional rows when absent.
+
+    If the super table was built from granular order lines (e.g., via `order_data`)
+    but the aggregated columns like `turnover_eur_2023` / `quantity_sold_2024`
+    are missing, this helper produces them. Existing year columns are left
+    untouched.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Transaction-level or partially aggregated data containing at least
+        identifier and a year indicator.
+    id_col : str, default 'item_number'
+        Product identifier column to aggregate by. Adjust if your table uses
+        `ProductId` instead.
+    year_col : str, default 'YearNumber'
+        Column with 4-digit year integers.
+    turnover_col : str, default 'TurnoverEuro'
+        Per-row turnover metric (sum basis).
+    quantity_col : str, default 'QuantitySold'
+        Per-row quantity metric (sum basis).
+    margin_col : str, default 'MarginEuro'
+        Per-row margin metric (sum basis) -> mapped to `margin_gross_eur_YEAR`.
+    list_price_turnover_col : str, default 'ListPriceTurnoverEuro'
+        Per-row list price turnover metric -> mapped to `list_price_turnover_eur_YEAR`.
+    create_orders : bool, default True
+        Whether to also create `orders_YEAR` columns counting distinct orders.
+
+    Returns
+    -------
+    DataFrame with missing year-suffixed columns added.
+    """
+    work = df.copy()
+    # Detect which year columns already exist to avoid recomputation
+    existing_cols = set(work.columns)
+
+    needed_map = {
+        turnover_col: "turnover_eur_{year}",
+        quantity_col: "quantity_sold_{year}",
+        margin_col: "margin_gross_eur_{year}",
+        list_price_turnover_col: "list_price_turnover_eur_{year}",
+    }
+
+    # Sanity: required raw columns present
+    base_missing = [c for c in (id_col, year_col) if c not in existing_cols]
+    if base_missing:
+        # Nothing we can do; return original unchanged
+        return work
+
+    # Work only with needed raw metric columns that exist
+    present_metric_cols = {raw: pat for raw, pat in needed_map.items() if raw in existing_cols}
+    if not present_metric_cols and not create_orders:
+        return work  # no metrics to build
+
+    # Prepare numeric conversions
+    for raw_col in present_metric_cols.keys():
+        work[raw_col] = pd.to_numeric(work[raw_col], errors="coerce")
+    if create_orders and "OrderNumber" in work.columns:
+        # Keep as string for counting distinct
+        work["OrderNumber"] = work["OrderNumber"].astype(str)
+
+    # Aggregate by (id_col, year)
+    group_keys = [id_col, year_col]
+    agg_dict: dict[str, str] = {raw: "sum" for raw in present_metric_cols.keys()}
+    if create_orders and "OrderNumber" in work.columns:
+        agg_dict["OrderNumber"] = "nunique"
+
+    grouped = work.groupby(group_keys, dropna=False).agg(agg_dict).reset_index()
+    # Pivot each metric to wide year-suffixed columns
+    for raw, pattern in present_metric_cols.items():
+        wide = grouped.pivot(index=id_col, columns=year_col, values=raw)
+        for yr, val in wide.items():  # pandas Series named by year
+            col_name = pattern.format(year=int(yr))
+            if col_name not in work.columns:
+                # Map values back into main frame using id_col
+                work = work.merge(wide[[yr]].rename(columns={yr: col_name}), left_on=id_col, right_index=True, how="left")
+    if create_orders and "OrderNumber" in agg_dict:
+        wide_o = grouped.pivot(index=id_col, columns=year_col, values="OrderNumber")
+        for yr, val in wide_o.items():
+            col_name = f"orders_{int(yr)}"
+            if col_name not in work.columns:
+                work = work.merge(wide_o[[yr]].rename(columns={yr: col_name}), left_on=id_col, right_index=True, how="left")
+
+    # Fill NaNs from merges with 0 for numeric new columns
+    new_cols = [c for c in work.columns if any(c.startswith(pref) for pref in ("turnover_eur_", "quantity_sold_", "margin_gross_eur_", "list_price_turnover_eur_", "orders_"))]
+    for c in new_cols:
+        work[c] = pd.to_numeric(work[c], errors="coerce").fillna(0)
+
+    return work
+
+
 def fetch_distinct_values(
     column: str,
     *,
@@ -308,7 +590,7 @@ def fetch_distinct_values(
 
     query = f"""
     SELECT DISTINCT {safe_col} AS value
-    FROM {TENDER_MATERIAL_FQN}
+    FROM {SUPER_TABLE_FQN}
     {where_clause}
     ORDER BY value
     {limit_sql}
@@ -368,7 +650,7 @@ def apply_df_filters(
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     # 1) Fetch a narrow sample with SQL-side filters
-    df = fetch_tender_material(
+    df = fetch_super_table(
         columns=["item_number", "item_description", "class_3", "brand_name",
                  "STEP_CountryOfOrigin", "supplier_name_string", "stop_purchase_ind",
                  "attribute_id", "locale_independent_values"],
@@ -393,3 +675,7 @@ if __name__ == "__main__":
             prefix="attr_",
         )
         print(f"Wide attrs shape: {wide.shape}")
+
+    # 3) Totals & summary example
+    df_tot = compute_totals(df)
+    print("Summary:", summarize_super_table(df_tot))

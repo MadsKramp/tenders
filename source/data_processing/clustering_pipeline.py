@@ -7,7 +7,7 @@ Scalable clustering pipeline on tender material using TWO features:
 - quantity_sold_total        (sum of quantity_sold_2021..2024)
 
 Data source (EU):
-  kramp-sharedmasterdata-prd.MadsH.tender_material
+  kramp-sharedmasterdata-prd.MadsH.super_table
 
 Filters (SQL-side) respected:
   class_2 / class_3 / class_4 / brand_name / STEP_CountryOfOrigin / supplier_name_string
@@ -142,7 +142,7 @@ def _build_sql(columns: Optional[Sequence[str]] = None, limit: Optional[int] = N
     sql = f"""
 SELECT
     {select_list}
-FROM {params.TENDER_MATERIAL_FQN}
+FROM {params.SUPER_TABLE_FQN}
 {_where_clause()}
 """
     if limit and isinstance(limit, int) and limit > 0:
@@ -169,7 +169,7 @@ def _coerce_numeric(df: pd.DataFrame, cols: Sequence[str]) -> pd.DataFrame:
 @dataclass
 class ClusteringPipeline:
     """
-    Clusters tender-material products by two features:
+    Clusters super-table products by two features:
       - purchase_amount_eur_total
       - quantity_sold_total
     with optional filters and EU BigQuery execution.
@@ -247,7 +247,7 @@ class ClusteringPipeline:
             df["orders_total"] = _sum_columns(df, _ORDERS_COLS)
             df = df.loc[df["orders_total"] >= int(min_transactions)].copy()
 
-        # Optional: rounding filter exists in sales tables; your tender table may not carry it
+        # Optional: rounding filter exists in sales tables; your super table may not carry it
         # Keeping the knob for compatibility; no-op here unless you have a rounding column joined later.
 
         # Keep only rows with positive signal in either feature (avoid all-zero rows)

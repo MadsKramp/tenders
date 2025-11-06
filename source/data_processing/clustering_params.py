@@ -2,7 +2,7 @@
 Centralized Parameters for Tender Material / Clustering Analysis
 
 This module centralizes all configuration used by notebooks and utilities:
-- Data source (EU): kramp-sharedmasterdata-prd.MadsH.tender_material
+- Data source (EU): kramp-sharedmasterdata-prd.MadsH.super_table
 - SQL-side filtering toggles and values (Class2/3/4, Brand, Country of Origin, Group Supplier)
 - Purchase-stop policy
 - Feature toggles (attributes pivoting, dimensions)
@@ -21,10 +21,28 @@ from typing import Optional, Sequence, Dict, List
 
 PROJECT_ID: str = os.getenv("PROJECT_ID", "kramp-sharedmasterdata-prd")
 DATASET_ID: str = os.getenv("DATASET_ID", "MadsH")
-TABLE_ID:   str = os.getenv("TABLE_ID", "tender_material")
+# Updated default to point at the denormalized super table (override via env if needed)
+TABLE_ID:   str = os.getenv("TABLE_ID", "super_table")
+
+# Sanitize any accidental fully-qualified strings in env vars (defensive):
+def _sanitize_project(pid: str) -> str:
+    # If someone passed 'proj.dataset.table', keep only first segment as project id.
+    return pid.split('.')[0] if '.' in pid else pid
+
+def _sanitize_dataset(did: str) -> str:
+    # If dataset mistakenly includes table (e.g. 'dataset.table'), take first segment.
+    return did.split('.')[0] if '.' in did else did
+
+def _sanitize_table(tid: str) -> str:
+    # If table mistakenly includes dataset (e.g. 'dataset.table'), take last segment.
+    return tid.split('.')[-1] if '.' in tid else tid
+
+PROJECT_ID = _sanitize_project(PROJECT_ID)
+DATASET_ID = _sanitize_dataset(DATASET_ID)
+TABLE_ID   = _sanitize_table(TABLE_ID)
 
 # Fully-qualified name used by query helpers
-TENDER_MATERIAL_FQN: str = f"`{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`"
+SUPER_TABLE_FQN: str = f"`{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`"  # canonical FQN
 
 # BigQuery job location – keep EU to avoid cross-region issues
 BQ_LOCATION: str = os.getenv("BQ_LOCATION", "EU")
@@ -36,7 +54,7 @@ ROW_LIMIT: Optional[int] = None  # e.g., 50_000
 # =============================================================================
 # DATA FILTERING PARAMETERS (SQL-side or DF-side)
 # =============================================================================
-# These map 1:1 to columns in MadsH.tender_material and to tender_material_utils.fetch_tender_material()
+# These map 1:1 to columns in MadsH.super_table and to super_table_utils.fetch_super_table()
 
 # Purchase-stop handling:
 #   'strict'  -> keep only stop_purchase_ind = 'N'
@@ -74,7 +92,7 @@ ROUNDING_FILTER: Optional[float] = 1.0  # None for all
 # Include product dimensions in clustering features (if you derive them later)
 INCLUDE_DIMENSIONS: bool = True
 
-# Attribute handling (from ciske attributes already joined in tender_material)
+# Attribute handling (from ciske attributes already joined in super_table)
 INCLUDE_ATTRIBUTES_WIDE: bool = True
 ATTR_VALUE_COLUMN: str = "locale_independent_values"  # or "localized_values"
 ATTR_COLUMN_NAME: str = "attribute_id"
@@ -111,7 +129,7 @@ CLUSTER_FEATURES: Sequence[str] = (
 
 def feature_spec() -> Dict[str, Dict[str, List[str] | str]]:
     """
-    Spec for building clustering features from tender_material columns.
+    Spec for building clustering features from super_table columns.
 
     Returns
     -------
@@ -162,12 +180,12 @@ OUTPUT_DIR: str = os.getenv("OUTPUT_DIR", "artifacts")
 
 
 # =============================================================================
-# HELPER: Build a kwargs dict for tender_material_utils.fetch_tender_material()
+# HELPER: Build a kwargs dict for super_table_utils.fetch_super_table()
 # =============================================================================
 
 def fetch_kwargs() -> dict:
     """
-    Compose keyword arguments for tender_material_utils.fetch_tender_material()
+    Compose keyword arguments for super_table_utils.fetch_super_table()
     based on the centralized parameters above.
     """
     return {
