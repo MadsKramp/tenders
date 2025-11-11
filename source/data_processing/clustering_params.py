@@ -52,31 +52,29 @@ ROW_LIMIT: Optional[int] = None  # e.g., 50_000
 
 
 # =============================================================================
-# DATA FILTERING PARAMETERS (SQL-side or DF-side)
+# DATA FILTERING PARAMETERS (aligned to analysis_utils.fetch_super_table_filtered)
 # =============================================================================
-# These map 1:1 to columns in MadsH.super_table and to super_table_utils.fetch_super_table()
+# Minimal filter surface: Class2, Class3, Brand, GroupVendorName (via purchase_data), description regex.
 
-# Purchase-stop handling:
-#   'strict'  -> keep only stop_purchase_ind = 'N'
-#   'lenient' -> keep rows where stop_purchase_ind != 'Y' OR IS NULL
-#   None      -> no purchase-stop filter
-PURCHASE_STOP_MODE: Optional[str] = "strict"
+# Exact match filters (None/empty => no filter)
+CLASS2: Optional[Sequence[str]] = ["Fasteners"]          # maps to column class_2
+CLASS3: Optional[Sequence[str]] = ["Threaded Rods"]      # maps to column class_3
+BRAND_NAME: Optional[Sequence[str]] = ["Kramp"]          # maps to column brand_name
+GROUP_VENDOR_NAME: Optional[Sequence[str]] = None         # maps to purchase_data.group_vendor_dim.GroupVendorName
 
-# Exact-match filters (None or empty list => no filter)
-CLASS2: Optional[Sequence[str]] = ["Fasteners"]        # ex: ["Fasteners"]
-CLASS3: Optional[Sequence[str]] = ["Threaded Rods"]    # ex: ["Threaded Rods"]
-CLASS4: Optional[Sequence[str]] = None                 # ex: ["1234 - Filters"]
-BRAND_NAME: Optional[Sequence[str]] = ["Kramp"]        # ex: ["Kramp", "Kubota"]
+# Regex keyword patterns (OR combined) matched against item_description (case-insensitive)
+DESCRIPTION_REGEX: Optional[Sequence[str]] = None         # e.g. ["stainless", "hex"]
+REGEX_WHOLE_WORD: bool = True                             # wrap each pattern in \b...\b if True
 
-# New filters you added:
-COUNTRY_OF_ORIGIN: Optional[Sequence[str]] = None      # column STEP_CountryOfOrigin, e.g., ["Germany","Italy"]
-GROUP_SUPPLIER: Optional[Sequence[str]] = None         # column supplier_name_string, e.g., ["Kerbl Group"]
-
-# Other optional filters
-ITEM_NUMBERS: Optional[Sequence[str]] = None           # item_number filter
-ATTRIBUTE_IDS: Optional[Sequence[str]] = None          # attribute_id filter
-KEYWORDS_IN_DESC: Optional[Sequence[str]] = None       # LIKE search on item_description (case-insensitive)
-NEGATE_FILTERS: bool = False                           # invert filters (rare)
+# Legacy / deprecated filters retained for compatibility (not used by simplified fetch)
+PURCHASE_STOP_MODE: Optional[str] = "strict"             # still consumed by broader fetch if used elsewhere
+CLASS4: Optional[Sequence[str]] = None                    # not used in simplified filtered fetch
+COUNTRY_OF_ORIGIN: Optional[Sequence[str]] = None         # not used in simplified filtered fetch
+GROUP_SUPPLIER: Optional[Sequence[str]] = None            # superseded by GROUP_VENDOR_NAME
+ITEM_NUMBERS: Optional[Sequence[str]] = None              # not used
+ATTRIBUTE_IDS: Optional[Sequence[str]] = None             # not used
+KEYWORDS_IN_DESC: Optional[Sequence[str]] = None          # superseded by DESCRIPTION_REGEX
+NEGATE_FILTERS: bool = False                              # rarely needed
 
 # Minimum transactions per product (for downstream analysis steps)
 MIN_TRANSACTIONS: int = 50
@@ -184,12 +182,12 @@ OUTPUT_DIR: str = os.getenv("OUTPUT_DIR", "artifacts")
 # =============================================================================
 
 def fetch_kwargs() -> dict:
-    """
-    Compose keyword arguments for super_table_utils.fetch_super_table()
-    based on the centralized parameters above.
+    """Backward-compatible kwargs for the original broad fetch_super_table helper.
+
+    Prefer ``filtered_fetch_kwargs()`` for the new minimal surface.
     """
     return {
-        "columns": None,                      # None -> default columns from helper
+        "columns": None,
         "class2": CLASS2,
         "class3": CLASS3,
         "class4": CLASS4,
@@ -203,3 +201,35 @@ def fetch_kwargs() -> dict:
         "limit": ROW_LIMIT,
         "debug_print_sql": False,
     }
+
+def filtered_fetch_kwargs() -> dict:
+    """Kwargs for analysis_utils.fetch_super_table_filtered (recommended)."""
+    return {
+        "class2": CLASS2,
+        "class3": CLASS3,
+        "brand": BRAND_NAME,
+        "group_vendor_name": GROUP_VENDOR_NAME,
+        "description_regex": DESCRIPTION_REGEX,
+        "regex_whole_word": REGEX_WHOLE_WORD,
+        "limit": ROW_LIMIT,
+        "debug_print_sql": False,
+    }
+
+__all__ = [
+    # data source constants
+    "PROJECT_ID", "DATASET_ID", "TABLE_ID", "SUPER_TABLE_FQN", "BQ_LOCATION",
+    # filters (new minimal + legacy)
+    "CLASS2", "CLASS3", "BRAND_NAME", "GROUP_VENDOR_NAME",
+    "DESCRIPTION_REGEX", "REGEX_WHOLE_WORD",
+    "PURCHASE_STOP_MODE", "CLASS4", "COUNTRY_OF_ORIGIN", "GROUP_SUPPLIER",
+    "ITEM_NUMBERS", "ATTRIBUTE_IDS", "KEYWORDS_IN_DESC", "NEGATE_FILTERS",
+    # clustering feature config
+    "CLUSTER_FEATURE_STRATEGY", "CLUSTER_FEATURE_YEARS", "CLUSTER_FEATURES", "feature_spec",
+    # clustering knobs
+    "MIN_CLUSTERS", "MAX_CLUSTERS", "N_CLUSTERS_OVERRIDE", "RANDOM_STATE",
+    "INCLUDE_KMEANS", "INCLUDE_HIERARCHICAL", "INCLUDE_DBSCAN", "DBSCAN_EPS", "DBSCAN_MIN_SAMPLES",
+    # output settings
+    "SHOW_VISUALIZATIONS", "EXPORT_RESULTS", "OUTPUT_DIR",
+    # helpers
+    "fetch_kwargs", "filtered_fetch_kwargs",
+]

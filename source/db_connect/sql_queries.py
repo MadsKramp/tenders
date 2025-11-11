@@ -32,61 +32,68 @@ from pathlib import Path
 from typing import Dict
 
 # ---------------------------------------------------------------------------
-# Core CREATE scripts
+# Core CREATE / DDL scripts (static canonical copies)
 # ---------------------------------------------------------------------------
 
+# Latest purchase_data build (aligned to current sqlScripts/create_purchase_data.sql)
 CREATE_PURCHASE_DATA_SQL: str = r"""CREATE SCHEMA IF NOT EXISTS `kramp-sharedmasterdata-prd.MadsH`;
 
--- 1) Stage sources as temp tables (keeps the final SELECT simple)
+-- 1) Stage sources
 CREATE TEMP TABLE rel AS
 SELECT *
 FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__REL__vendorProductCompany__current`;
 
 CREATE TEMP TABLE v AS
 SELECT *
-FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__DIM__vendor__current`;
+FROM `kramp-sharedmasterdata-prd.dbt_cloud_pr_249255_174_1748257232.PRES__DIM__vendor__current`;
 
 CREATE TEMP TABLE gv AS
 SELECT *
-FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__DIM__groupVendor__current`;
+FROM `kramp-sharedmasterdata-prd.dbt_cloud_pr_249255_174_1748257232.PRES__DIM__groupVendor__current`;
 
 CREATE TEMP TABLE cal AS
 SELECT *
 FROM `kramp-purchase-prd.kramp_purchase_presentation.PRES__CAL__PurchasePerProduct`;
 
--- 2) Build final table
+-- 2) Base join: REL + V + GV
+--    REL.VendorId = V.UniqueVendorCode
+--    V.GroupVendorId = GV.GroupVendorId
+CREATE TEMP TABLE base AS
+SELECT
+	r.*,
+	(SELECT AS STRUCT v.*)  AS vendor_dim,
+	(SELECT AS STRUCT gv.*) AS group_vendor_dim
+FROM rel r
+LEFT JOIN v
+	ON CAST(r.VendorId AS STRING) = CAST(v.UniqueVendorCode AS STRING)
+LEFT JOIN gv
+	ON v.GroupVendorId = gv.GroupVendorId;
+
+-- 3) Final: add CAL on Product + UniqueVendorCode
+--    REL.ProductId = CAL.ProductNumber
+--    V.UniqueVendorCode = CAL.uniquevendorcode
 DROP TABLE IF EXISTS `kramp-sharedmasterdata-prd.MadsH.purchase_data`;
 
--- NOTE on joins:
---  - Join CAL on (ProductId, CompanyId). If CAL also has VendorId and you want tighter matching,
---    add: AND rel.VendorId = cal.VendorId
 CREATE TABLE `kramp-sharedmasterdata-prd.MadsH.purchase_data` AS
 SELECT
-	-- Useful scalar keys at top level
-	rel.CompanyId,
-	rel.ProductId,
-	rel.VendorId,
+	-- handy top-level keys
+	b.CompanyId,
+	b.ProductId,
+	b.VendorId,
 
-	-- Nest full source payloads to avoid duplicate-column conflicts.
-	(SELECT AS STRUCT rel.*) AS vendor_product_company,
-	(SELECT AS STRUCT v.*)   AS vendor_dim,
-	(SELECT AS STRUCT gv.*)  AS group_vendor_dim,
-	(SELECT AS STRUCT cal.*) AS purchase_per_product
+	-- optional: surface a few CAL fields directly
+	c.ProductNumber,
+	c.uniquevendorcode,
 
-FROM rel
-LEFT JOIN v
-	ON rel.VendorId = v.VendorId
-LEFT JOIN gv
-	ON v.GroupVendorId = gv.GroupVendorId
-LEFT JOIN cal
-	ON rel.ProductId = cal.ProductId
- AND rel.CompanyId = cal.CompanyId;
- -- AND rel.VendorId  = cal.VendorId;  -- <- uncomment if CAL has VendorId and you want exact vendor match
-
--- 3) (Optional) sanity checks
--- SELECT COUNT(*) AS rows_total FROM `kramp-sharedmasterdata-prd.MadsH.purchase_data`;
--- SELECT CompanyId, COUNT(*) c FROM `kramp-sharedmasterdata-prd.MadsH.purchase_data` GROUP BY 1 ORDER BY c DESC;
--- SELECT vendor_dim.VendorNumber, purchase_per_product.* FROM `kramp-sharedmasterdata-prd.MadsH.purchase_data` LIMIT 5;"""
+	-- keep full payloads nested to avoid column collisions
+	(SELECT AS STRUCT b.* EXCEPT(vendor_dim, group_vendor_dim)) AS vendor_product_company,
+	b.vendor_dim,
+	b.group_vendor_dim,
+	(SELECT AS STRUCT c.*) AS purchase_per_product
+FROM base b
+LEFT JOIN cal c
+	ON CAST(b.ProductId AS STRING)        = CAST(c.ProductNumber    AS STRING)
+ AND CAST(b.vendor_dim.UniqueVendorCode AS STRING) = CAST(c.uniquevendorcode AS STRING);"""
 
 CREATE_SUPPLIER_DATA_SQL: str = r"""CREATE SCHEMA IF NOT EXISTS `kramp-sharedmasterdata-prd.MadsH`;
 
@@ -143,66 +150,52 @@ LEFT JOIN cal
 
 CREATE_PRODUCT_DATA_SQL: str = r"""CREATE SCHEMA IF NOT EXISTS `kramp-sharedmasterdata-prd.MadsH`;
 
--- ============================================================================
--- PRODUCT ATTRIBUTE TABLE BUILD (product_data)
--- See original file for extended commentary.
--- ============================================================================
-
-CREATE TEMP TABLE wholesale AS
-SELECT *
-FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_customquery.CMQ__product_wholesale`;
-
-CREATE TEMP TABLE step_value AS
-SELECT *
-FROM `kramp-sharedmasterdata-prd.dbt_cloud_pr_258697_428_1739806806.SRC__STEP__Value__latest`;
-
-CREATE TEMP TABLE step_attribute AS
-SELECT *
-FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source.SRC__STEP__Attribute__latest`;
-
-CREATE TEMP TABLE brick_attribute_template AS
-SELECT *
-FROM `kramp-sharedmasterdata-prd.dbt_cloud_pr_258697_428_1739806806.SRC__STEP__Brick_Attribute_Template__latest`;
-
-CREATE TEMP TABLE hierarchy AS
-SELECT *
-FROM `kramp-sharedmasterdata-prd.dbt_cloud_pr_258697_428_1739806806.SRC__STEP__Technical_Item_Classification_Hierarchy__latest`;
+-- Canonical product attribute extraction (aligned to sqlScripts/create_product_data.sql)
+-- Stages
+CREATE TEMP TABLE rel AS
+SELECT * FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_customquery.CMQ__product_wholesale`;
+CREATE TEMP TABLE v AS
+SELECT * FROM `kramp-sharedmasterdata-prd.dbt_cloud_pr_258697_428_1739806806.SRC__STEP__Value__latest`;
+CREATE TEMP TABLE gv AS
+SELECT * FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source.SRC__STEP__Attribute__latest`;
+CREATE TEMP TABLE cal AS
+SELECT * FROM `kramp-sharedmasterdata-prd.dbt_cloud_pr_258697_428_1739806806.SRC__STEP__Brick_Attribute_Template__latest`;
+CREATE TEMP TABLE cal AS
+SELECT * FROM `kramp-sharedmasterdata-prd.dbt_cloud_pr_258697_428_1739806806.SRC__STEP__Technical_Item_Classification_Hierarchy__latest`;
 
 DROP TABLE IF EXISTS `kramp-sharedmasterdata-prd.MadsH.product_data`;
 
 CREATE TABLE `kramp-sharedmasterdata-prd.MadsH.product_data` AS
 WITH prod_bricks AS (
-	SELECT w.*, h.BrickID
-	FROM wholesale AS w
-	LEFT JOIN hierarchy AS h ON w.product_id = h.GoldenItemID
+  SELECT w.*, h.BrickID
+  FROM t1 AS w
+  LEFT JOIN t5 AS h ON w.product_id = h.GoldenItemID
 ),
 value_expected AS (
-	SELECT pb.product_id, pb.BrickID, sv.ID AS step_id, sv.AttributeID, sv.Value AS AttributeValue
-	FROM prod_bricks AS pb
-	LEFT JOIN step_value AS sv
-		ON sv.ID = pb.product_id AND SUBSTR(sv.ID, 1, 13) = 'ticGoldenItem'
-	LEFT JOIN brick_attribute_template AS bat
-		ON bat.BrickID = pb.BrickID AND bat.AttributeID = sv.AttributeID
-	WHERE pb.product_id IS NOT NULL
+  SELECT pb.product_id, pb.BrickID, v.ID AS step_id, v.AttributeID, v.Value AS AttributeValue
+  FROM prod_bricks AS pb
+  LEFT JOIN t2 AS v
+    ON v.ID = pb.product_id AND SUBSTR(v.ID, 1, 13) = 'ticGoldenItem'
+  LEFT JOIN t4 AS bat
+    ON bat.BrickID = pb.BrickID AND bat.AttributeID = v.AttributeID
+  WHERE pb.product_id IS NOT NULL
 ),
 value_with_meta AS (
-	SELECT ve.product_id, ve.BrickID, ve.AttributeID,
-				 sa.Name_ENG AS AttributeName, sa.AttributeType, ve.AttributeValue
-	FROM value_expected AS ve
-	LEFT JOIN step_attribute AS sa ON ve.AttributeID = sa.ID
-	WHERE ve.AttributeID IS NOT NULL
+  SELECT ve.product_id, ve.BrickID, ve.AttributeID,
+         a.Name_ENG AS AttributeName, a.AttributeType, ve.AttributeValue
+  FROM value_expected AS ve
+  LEFT JOIN t3 AS a ON ve.AttributeID = a.ID
+  WHERE ve.AttributeID IS NOT NULL
 )
 SELECT product_id, BrickID, AttributeID, AttributeName, AttributeType, AttributeValue
 FROM value_with_meta
 ORDER BY product_id, AttributeName;"""
 
-CREATE_ORDER_DATA_SQL: str = r"""-- ============================================================================
--- ORDER DATA TABLE BUILD (order_data)
--- Cleaned & parameterized version.
--- ============================================================================
+CREATE_ORDER_DATA_SQL: str = r"""-- Canonical order_data build (aligned to sqlScripts/create_order_data.sql)
 
-DECLARE class2_filter ARRAY<STRING> DEFAULT ['54 - Fasteners'];
+DECLARE class2_filter ARRAY<STRING> DEFAULT ['54 - Fasteners']; -- Empty [] for all
 
+-- 1) Sales fact rows
 CREATE TEMP TABLE items_sold AS
 SELECT
 	OrderNumber, InvoiceDate, InvoiceNumber, InvoiceType,
@@ -226,6 +219,7 @@ FROM `kramp-sales-prd.kramp_sales_customquery.CUQ__TBL__externalSales_enriched`
 WHERE OrderNumber IS NOT NULL
 	AND YearNumber > 2020;
 
+-- 2) Product scope
 CREATE TEMP TABLE items_in_scope AS
 SELECT DISTINCT
 	item.ID AS ItemID,
@@ -250,8 +244,9 @@ SELECT DISTINCT
 		ELSE NULL
 	END AS brand_type_step,
 	CASE
-		WHEN LOWER(item.ItemDescription_ENG) LIKE '%nut%' AND hier.Class3Description = 'Bolts & Nuts'
-			THEN CAST(attr.taLengthMm_5 AS NUMERIC)
+		WHEN LOWER(item.ItemDescription_ENG) LIKE '%nut%'
+			AND hier.Class3Description = 'Bolts & Nuts'
+		THEN CAST(attr.taLengthMm_5 AS NUMERIC)
 	END AS dimension_per_product_type
 FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source.SRC__STEP__Item__latest` item
 LEFT JOIN `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source.SRC__STEP__Class234_Hierarchy__latest` hier
@@ -269,6 +264,7 @@ LEFT JOIN (
 WHERE PublishableInCountry IS NOT NULL
 	AND (ARRAY_LENGTH(class2_filter) = 0 OR hier.Class2Description IN UNNEST(class2_filter));
 
+-- 3) Purchase stop status
 CREATE TEMP TABLE products_purchasestop AS
 SELECT
 	b.ProductNumber,
@@ -284,10 +280,12 @@ LEFT JOIN `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__
 WHERE c.CompanyShortDescription LIKE 'Kramp %'
 GROUP BY b.ProductNumber;
 
+-- 4) Final table
 DROP TABLE IF EXISTS `kramp-sharedmasterdata-prd.MadsH.order_data`;
 
 CREATE TABLE `kramp-sharedmasterdata-prd.MadsH.order_data` AS
-SELECT s.*, scope.*, ps.PurchaseStopInd
+SELECT
+	s.*, scope.*, ps.PurchaseStopInd
 FROM items_sold AS s
 JOIN items_in_scope AS scope ON scope.ItemNumber = s.ProductNumber
 LEFT JOIN products_purchasestop AS ps ON scope.ItemNumber = ps.ProductNumber;"""
@@ -318,14 +316,73 @@ WHERE
 # Registry & accessor
 # ---------------------------------------------------------------------------
 
+SUPER_TABLE_SQL: str = r"""CREATE SCHEMA IF NOT EXISTS `kramp-sharedmasterdata-prd.MadsH`;
+DROP TABLE IF EXISTS `kramp-sharedmasterdata-prd.MadsH.super_table`;
+WITH product_attr_source AS (
+	SELECT
+		product_id,
+		AttributeID,
+		AttributeName,
+		AttributeType,
+		AttributeValue
+	FROM `kramp-sharedmasterdata-prd.MadsH.product_data`
+), product_attr_agg AS (
+	SELECT
+		product_id,
+		ARRAY_AGG(STRUCT(AttributeID, AttributeName, AttributeType, AttributeValue) ORDER BY AttributeName) AS attributes
+	FROM product_attr_source
+	GROUP BY product_id
+), attr_key_value AS (
+	SELECT
+		product_id,
+		TO_JSON_STRING((SELECT AS STRUCT ARRAY_AGG(STRUCT(AttributeName, AttributeValue) ORDER BY AttributeName LIMIT 50))) AS attributes_kv_json
+	FROM product_attr_source
+	GROUP BY product_id
+)
+CREATE TABLE `kramp-sharedmasterdata-prd.MadsH.super_table` AS
+SELECT
+	o.*,                              -- all order-level metrics / classification columns
+	pu.purchase_per_product,          -- nested STRUCT from purchase_data
+	pa.attributes,                    -- ARRAY<STRUCT<...>> full attribute list
+	kv.attributes_kv_json             -- small JSON key/value snapshot
+FROM `kramp-sharedmasterdata-prd.MadsH.order_data` AS o
+LEFT JOIN `kramp-sharedmasterdata-prd.MadsH.purchase_data` AS pu
+	ON pu.ProductId = o.ProductId
+LEFT JOIN product_attr_agg AS pa
+	ON pa.product_id = o.ProductId
+LEFT JOIN attr_key_value AS kv
+	ON kv.product_id = o.ProductId;"""
+
+PROGRESS_TABLE_SQL: str = r"""CREATE TABLE `kramp-sharedmasterdata-prd.MadsH.super_table_progress` AS
+
+SELECT DISTINCT 
+		CAST(ItemNumber AS STRING) AS ItemNumber
+	, SAFE_CAST(Rounding AS FLOAT64) AS old_rounding
+	, CAST(NULL AS INT64) AS new_rounding
+	, CAST(FALSE AS BOOLEAN) AS processed
+	, CAST(NULL AS DATE) AS processed_date
+	, '' AS action
+FROM `kramp-sharedmasterdata-prd.MadsH.super_table_progress`;"""
+
+UPDATE_PROGRESS_SQL: str = r"""UPDATE
+	`kramp-sharedmasterdata-prd.MadsH.super_table_progress` AS t1
+SET
+	processed = TRUE,
+	processed_date = '2025-09-11',
+	action = ''
+FROM
+	`kramp-sharedmasterdata-prd.MadsH.super_table_progress` AS t2
+WHERE
+	t1.ItemNumber = t2.string_field_0;"""
+
 _STATIC_SQL: Dict[str, str] = {
-	"create_purchase_data": CREATE_PURCHASE_DATA_SQL,
-	"create_supplier_data": CREATE_SUPPLIER_DATA_SQL,
-	"create_product_data": CREATE_PRODUCT_DATA_SQL,
-	"create_order_data": CREATE_ORDER_DATA_SQL,
-	"progress_table": CREATE_PROGRESS_TABLE_SQL,
-	"update_progress": UPDATE_PROGRESS_SQL,
-	"super_table": """-- SUPER TABLE (see sqlScripts/super_table.sql for annotated version)\nCREATE SCHEMA IF NOT EXISTS `kramp-sharedmasterdata-prd.MadsH`;\nDROP TABLE IF EXISTS `kramp-sharedmasterdata-prd.MadsH.super_table`;\nWITH product_attr_source AS (\n  SELECT product_id, AttributeID, AttributeName, AttributeType, AttributeValue\n  FROM `kramp-sharedmasterdata-prd.MadsH.product_data`\n), product_attr_agg AS (\n  SELECT product_id, ARRAY_AGG(STRUCT(AttributeID, AttributeName, AttributeType, AttributeValue) ORDER BY AttributeName) AS attributes\n  FROM product_attr_source GROUP BY product_id\n), attr_key_value AS (\n  SELECT product_id, TO_JSON_STRING((SELECT AS STRUCT ARRAY_AGG(STRUCT(AttributeName, AttributeValue) ORDER BY AttributeName LIMIT 50))) AS attributes_kv_json\n  FROM product_attr_source GROUP BY product_id\n)\nCREATE TABLE `kramp-sharedmasterdata-prd.MadsH.super_table` AS\nSELECT o.*, pu.purchase_per_product, pa.attributes, kv.attributes_kv_json\nFROM `kramp-sharedmasterdata-prd.MadsH.order_data` AS o\nLEFT JOIN `kramp-sharedmasterdata-prd.MadsH.purchase_data` AS pu ON pu.ProductId = o.ProductId\nLEFT JOIN product_attr_agg AS pa ON pa.product_id = o.ProductId\nLEFT JOIN attr_key_value AS kv ON kv.product_id = o.ProductId;""",
+		"create_purchase_data": CREATE_PURCHASE_DATA_SQL,
+		"create_supplier_data": CREATE_SUPPLIER_DATA_SQL,
+		"create_product_data": CREATE_PRODUCT_DATA_SQL,
+		"create_order_data": CREATE_ORDER_DATA_SQL,
+		"super_table": SUPER_TABLE_SQL,
+		"progress_table": PROGRESS_TABLE_SQL,
+		"update_progress": UPDATE_PROGRESS_SQL,
 }
 
 def _discover_sql_files() -> Dict[str, str]:  # pragma: no cover (I/O)
@@ -371,12 +428,13 @@ def get_sql(key: str) -> str:
         raise KeyError(f"Unknown SQL key '{key}'. Available: {sorted(SQL_SCRIPTS)}") from e
 
 __all__ = [
-	# Static constants
+	# Static canonical SQL
 	"CREATE_PURCHASE_DATA_SQL",
 	"CREATE_SUPPLIER_DATA_SQL",
 	"CREATE_PRODUCT_DATA_SQL",
 	"CREATE_ORDER_DATA_SQL",
-	"CREATE_PROGRESS_TABLE_SQL",
+	"SUPER_TABLE_SQL",
+	"PROGRESS_TABLE_SQL",
 	"UPDATE_PROGRESS_SQL",
 	# Registry helpers
 	"SQL_SCRIPTS",

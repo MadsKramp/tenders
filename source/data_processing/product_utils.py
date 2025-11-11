@@ -3,11 +3,12 @@
 Pure DataFrame utilities for product data. I/O lives in gbq_io.py.
 
 Includes:
-- Validation + light dtype coercion (pyarrow strings).
-- Filters (restricted): Class2, Class3, Class4, BrandName, Country of Origin, Group Supplier.
-- Brand standardization using a synonym map.
-- Year-metric helpers (wide→long) and simple group summaries.
-- Optional GBQ loader thin-wrapper delegating to gbq_io.select_df().
+* Validation + light dtype coercion (pyarrow strings).
+* Legacy filters (restricted): Class2, Class3, Class4, BrandName, Country of Origin, Group Supplier.
+* NEW simplified filter helpers aligned with analysis_utils: (Class2, Class3, BrandName, GroupSupplier) + description keyword/regex search (optional whole-word).
+* Brand standardization using a synonym map.
+* Year-metric helpers (wide→long) and simple group summaries.
+* Optional GBQ loader thin-wrapper delegating to gbq_io.select_df().
 
 Default scheduled table (Monday refresh):
   kramp-sharedmasterdata-prd.kramp_sharedmasterdata_customquery
@@ -47,6 +48,8 @@ __all__ = [
     "filter_by",
     "filter_by_class2", "filter_by_class3", "filter_by_class4", "filter_by_brand_name",
     "filter_by_country_of_origin", "filter_by_group_supplier",
+    # Simplified filtering additions
+    "filter_description_keywords", "apply_simplified_filters", "build_description_regex",
     "filter_not_purchase_stop", "assert_no_purchase_stop",
     # Brand canonicalization
     "BrandMap", "standardize_brand",
@@ -234,6 +237,89 @@ def filter_by_country_of_origin(df: pd.DataFrame, values: Iterable[str], negate:
 def filter_by_group_supplier(df: pd.DataFrame, values: Iterable[str], negate: bool = False) -> pd.DataFrame:
     """Case-insensitive filter on supplier_name_string (group supplier)."""
     return filter_by(df, "supplier_name_string", values, negate)
+
+# ---- Simplified description regex/keyword filtering -------------------------
+
+def build_description_regex(keywords: Sequence[str], *, whole_word: bool = False) -> Optional[str]:
+    """Construct a single case-insensitive regex OR-ing the provided keywords.
+
+    Parameters
+    ----------
+    keywords : list/sequence of str
+        Raw keyword tokens; empty/blank strings are ignored.
+    whole_word : bool, default False
+        If True, wraps each keyword with word boundaries (\b) for whole word matching.
+
+    Returns
+    -------
+    str | None
+        Compiled pattern string (without flags) or None if no valid keywords.
+    """
+    cleaned = []
+    for kw in keywords:
+        kw = (kw or "").strip()
+        if not kw:
+            continue
+        # Escape regex special chars except spaces
+        safe = re.escape(kw)
+        if whole_word:
+            safe = fr"\b{safe}\b"
+        cleaned.append(safe)
+    if not cleaned:
+        return None
+    # Combine with | alternation
+    return "(" + "|".join(cleaned) + ")"
+
+
+def filter_description_keywords(
+    df: pd.DataFrame,
+    keywords: Sequence[str],
+    *,
+    whole_word: bool = False,
+    regex_pattern: Optional[str] = None,
+) -> pd.DataFrame:
+    """Filter rows where item_description matches ANY of the given keywords.
+
+    Either a pre-built regex_pattern can be supplied or raw keywords will be
+    combined using ``build_description_regex``.
+    Matching is case-insensitive.
+    """
+    if "item_description" not in df.columns:
+        raise ValueError("Column 'item_description' not present.")
+    pattern = regex_pattern or build_description_regex(keywords, whole_word=whole_word)
+    if not pattern:
+        return df.copy()
+    regex = re.compile(pattern, flags=re.IGNORECASE)
+    mask = df["item_description"].astype(str).str.contains(regex)
+    return df.loc[mask].copy()
+
+
+def apply_simplified_filters(
+    df: pd.DataFrame,
+    *,
+    class2: Optional[Sequence[str]] = None,
+    class3: Optional[Sequence[str]] = None,
+    brand: Optional[Sequence[str]] = None,
+    group_supplier: Optional[Sequence[str]] = None,
+    description_keywords: Optional[Sequence[str]] = None,
+    description_whole_word: bool = False,
+) -> pd.DataFrame:
+    """Apply the simplified filtering surface used by clustering & analysis.
+
+    All arguments are optional; blank / None leaves that filter unused.
+    """
+    out = df.copy()
+    if class2:
+        out = filter_by_class2(out, class2)
+    if class3:
+        out = filter_by_class3(out, class3)
+    if brand:
+        out = filter_by_brand_name(out, brand)
+    if group_supplier:
+        out = filter_by_group_supplier(out, group_supplier)
+    if description_keywords:
+        out = filter_description_keywords(out, description_keywords, whole_word=description_whole_word)
+    return out
 
 # ---- Brand canonicalization --------------------------------------------------
 @dataclass(frozen=True)

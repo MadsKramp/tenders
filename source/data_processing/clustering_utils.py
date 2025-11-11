@@ -1,16 +1,29 @@
-"""
-clustering_utils.py
--------------------
+"""clustering_utils
+====================
 
-Utilities for clustering tender-material products using TWO numeric features:
-  1) purchase_amount_eur_total  (sum: purchase_amount_eur_2020..2024)
-  2) quantity_sold_total        (sum: quantity_sold_2021..2024)
+Updated utilities for clustering tender-material products using a dynamic set of
+numeric features derived from yearly columns defined in
+``clustering_params.feature_spec()``.
 
-Data source (EU): params.SUPER_TABLE_FQN
-Filters honored (SQL-side): class_2/3/4, brand_name, STEP_CountryOfOrigin, supplier_name_string,
-                            item_number, keyword_in_desc; purchase-stop policy.
+Core philosophy now matches ``clustering_pipeline`` and ``analysis_utils``:
+    * Simplified filtering surface (Class2, Class3, Brand, GroupVendorName, description regex)
+    * Data fetched via ``analysis_utils.fetch_super_table_filtered`` instead of manual SQL.
+    * Feature derivation supports strategies: ``sum`` | ``latest`` | ``mean``.
 
-Designed to be used standalone or by a pipeline (e.g., clustering_pipeline.py).
+Backward compatibility:
+    * Legacy helpers (manual SQL builder, purchase_stop_ind filters) retained but marked deprecated.
+    * Two-feature specific helpers adapted to dynamic feature list.
+
+Primary high-level steps for clustering outside the pipeline:
+    1. ``fetch_filtered_super_table()`` – get filtered slice.
+    2. ``compute_totals(df)`` (from analysis_utils) – optional wide totals helper.
+    3. ``build_feature_columns(df)`` – derive clustering feature columns.
+    4. Scale with ``scale_features``.
+    5. Optimize / run clustering (KMeans / Agglomerative / DBSCAN).
+    6. Summarize with ``analyze_clusters``.
+
+These utilities are import-safe and fall back gracefully if optional pieces are
+missing. Visualizations & exports remain similar to previous version.
 """
 
 from __future__ import annotations
@@ -28,6 +41,21 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans, AgglomerativeClustering, DBSCAN
 from sklearn.metrics import silhouette_score, calinski_harabasz_score
+
+# -----------------------------------------------------------------------------
+# Updated filtered fetch & totals helpers
+# -----------------------------------------------------------------------------
+try:  # prefer absolute import
+    from source.data_processing.analysis_utils import (
+        fetch_super_table_filtered,
+        compute_totals,
+    )
+except ImportError:  # pragma: no cover
+    try:
+        from .analysis_utils import fetch_super_table_filtered, compute_totals  # type: ignore
+    except Exception:  # pragma: no cover
+        fetch_super_table_filtered = None  # type: ignore
+        compute_totals = None  # type: ignore
 
 # -----------------------------------------------------------------------------
 # Config / params
@@ -55,7 +83,7 @@ except ImportError:
 # Constants & helpers
 # =============================================================================
 
-PURCHASE_COLS = [
+PURCHASE_COLS = [  # retained for backward compatibility / totals
     "purchase_amount_eur_2020",
     "purchase_amount_eur_2021",
     "purchase_amount_eur_2022",
@@ -72,68 +100,28 @@ QTY_COLS = [
 
 ORDERS_COLS = ["orders_2021", "orders_2022", "orders_2023", "orders_2024"]
 
+# Deprecated legacy base column list (manual SQL path). Use fetch_super_table_filtered instead.
 BASE_SELECT_COLS = [
-    # identifiers / meta
     "item_number",
     "item_description",
-    "class_2", "class_3", "class_4",
+    "class_2", "class_3", "class_4",  # class_4 kept only for legacy reference
     "brand_name",
     "STEP_CountryOfOrigin",
     "supplier_name_string",
     "stop_purchase_ind",
-    # signals
 ] + PURCHASE_COLS + QTY_COLS + ORDERS_COLS
 
 
-def _fmt_in(values: Sequence[str]) -> str:
-    safe = [str(v).replace("'", "\\'") for v in values]
-    return "(" + ", ".join([f"'{s.upper()}'" for s in safe]) + ")"
+def _deprecated_where_clause() -> str:  # pragma: no cover - retained only for legacy
+    """Deprecated legacy WHERE clause builder (use filtered_fetch_kwargs + fetch_super_table_filtered)."""
+    return ""  # intentionally no-op now
 
 
-def _where_clause() -> str:
-    """Build WHERE clause from super_table_params filters."""
-    where = []
-
-    mode = (params.PURCHASE_STOP_MODE or "").strip().lower()
-    if mode == "strict":
-        where.append("stop_purchase_ind = 'N'")
-    elif mode == "lenient":
-        where.append("(stop_purchase_ind IS NULL OR UPPER(stop_purchase_ind) != 'Y')")
-
-    def add_eq_in(col: str, values: Optional[Sequence[str]]):
-        if values:
-            where.append(f"UPPER({col}) IN {_fmt_in(values)}")
-
-    add_eq_in("class_2", params.CLASS2)
-    add_eq_in("class_3", params.CLASS3)
-    add_eq_in("class_4", params.CLASS4)
-    add_eq_in("brand_name", params.BRAND_NAME)
-    add_eq_in("STEP_CountryOfOrigin", params.COUNTRY_OF_ORIGIN)
-    add_eq_in("supplier_name_string", params.GROUP_SUPPLIER)
-    add_eq_in("item_number", params.ITEM_NUMBERS)
-
-    # keyword search in description
-    if params.KEYWORDS_IN_DESC:
-        likes = []
-        for kw in params.KEYWORDS_IN_DESC:
-            kw = (kw or "").strip()
-            if kw:
-                likes.append(f"LOWER(item_description) LIKE '%{kw.lower().replace('%','\\%')}%'")
-        if likes:
-            where.append("(" + " OR ".join(likes) + ")")
-
-    return ("WHERE " + " AND ".join(where)) if where else ""
-
-
-def _build_sql(columns: Optional[Sequence[str]] = None, limit: Optional[int] = None) -> str:
+def _deprecated_build_sql(columns: Optional[Sequence[str]] = None, limit: Optional[int] = None) -> str:  # pragma: no cover
+    """Deprecated manual SQL construction (replaced by fetch_super_table_filtered)."""
     sel_cols = columns or BASE_SELECT_COLS
     select_list = ",\n    ".join(sel_cols)
-    sql = f"""
-SELECT
-    {select_list}
-FROM {params.SUPER_TABLE_FQN}
-{_where_clause()}
-"""
+    sql = f"SELECT\n    {select_list}\nFROM {params.SUPER_TABLE_FQN}\n"  # legacy path omitted filters
     if limit and isinstance(limit, int) and limit > 0:
         sql += f"LIMIT {limit}\n"
     return sql
@@ -159,59 +147,74 @@ def _coerce_numeric(df: pd.DataFrame, cols: Sequence[str]) -> pd.DataFrame:
 # Data fetch & feature preparation
 # =============================================================================
 
-def fetch_super_table(
-    *,
-    columns: Optional[Sequence[str]] = None,
-    limit: Optional[int] = params.ROW_LIMIT,
-    debug_print_sql: bool = False,
-) -> pd.DataFrame:
-    """
-    Fetch filtered rows from super_table with EU location.
-    """
-    sql = _build_sql(columns=columns, limit=limit)
-    if debug_print_sql:
-        print(sql)
+def fetch_filtered_super_table(*, include_purchase: bool = True, include_description_regex: bool = True) -> pd.DataFrame:
+    """Public fetch wrapper using simplified filtering API.
 
-    bq = BigQueryConnector()
-    try:
-        df = bq.query(sql, location=params.BQ_LOCATION)  # if your connector supports it
-    except TypeError:
-        df = bq.query(sql)
-
+    Parameters mirror ``clustering_params.filtered_fetch_kwargs`` (those are injected automatically).
+    Additional toggles allow ignoring description regex or purchase_data join if needed.
+    """
+    if fetch_super_table_filtered is None:
+        raise ImportError("analysis_utils.fetch_super_table_filtered not available; ensure analysis_utils.py is present.")
+    kwargs = params.filtered_fetch_kwargs()
+    if not include_description_regex:
+        kwargs["description_regex"] = None
+    if not include_purchase:
+        kwargs["include_purchase"] = False
+    df = fetch_super_table_filtered(**kwargs)
     if df is None or df.empty:
-        raise ValueError("No data returned from BigQuery with current filters.")
-
-    df = _coerce_numeric(df, PURCHASE_COLS + QTY_COLS + ORDERS_COLS)
+        raise ValueError("No data returned with current simplified filters.")
+    # Totals helper (optional if compute_totals available)
+    if compute_totals is not None:
+        df = compute_totals(df)
     return df
 
 
-def prepare_two_feature_df(
+def build_feature_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Derive feature columns specified in params.feature_spec().
+
+    Each spec entry: {'from': [...year cols...], 'strategy': 'sum|latest|mean'}.
+    Missing source columns -> feature filled with 0.0.
+    """
+    spec = params.feature_spec()
+    work = df.copy()
+    for feat_name, cfg in spec.items():
+        cols = [c for c in cfg.get("from", []) if c in work.columns]
+        if not cols:
+            work[feat_name] = 0.0
+            continue
+        block = work[cols].apply(pd.to_numeric, errors="coerce")
+        strat = str(cfg.get("strategy", "sum")).lower()
+        if strat == "latest":
+            work[feat_name] = block.ffill(axis=1).iloc[:, -1].fillna(0)
+        elif strat == "mean":
+            work[feat_name] = block.mean(axis=1).fillna(0)
+        else:
+            work[feat_name] = block.sum(axis=1).fillna(0)
+    return work
+
+
+def prepare_feature_df(
     df: pd.DataFrame,
     *,
     min_transactions: Optional[int] = params.MIN_TRANSACTIONS,
 ) -> Tuple[pd.DataFrame, List[str]]:
+    """Apply feature derivation + basic filters.
+
+    - Derive dynamic feature columns per feature_spec.
+    - Optional transaction threshold (orders_total) if present.
+    - Drop rows where all features == 0.
+    Returns (prepared_df, feature_column_list).
     """
-    Adds aggregate columns and applies basic readiness filtering:
-      - purchase_amount_eur_total
-      - quantity_sold_total
-      - (optional) orders_total >= min_transactions
-      - drop rows with both totals == 0
-    """
-    work = df.copy()
+    work = build_feature_columns(df)
 
-    work["purchase_amount_eur_total"] = _sum_columns(work, PURCHASE_COLS)
-    work["quantity_sold_total"] = _sum_columns(work, QTY_COLS)
+    # Transaction threshold using orders_total if available
+    if "orders_total" in work.columns and min_transactions:
+        work = work.loc[work["orders_total"] >= int(min_transactions)].copy()
 
-    if any(c in work.columns for c in ORDERS_COLS):
-        work["orders_total"] = _sum_columns(work, ORDERS_COLS)
-        if min_transactions:
-            work = work.loc[work["orders_total"] >= int(min_transactions)].copy()
-
-    work = work.loc[
-        (work["purchase_amount_eur_total"] > 0) | (work["quantity_sold_total"] > 0)
-    ].copy()
-
-    feature_cols = ["purchase_amount_eur_total", "quantity_sold_total"]
+    feature_cols = list(params.CLUSTER_FEATURES)
+    # Remove all-zero rows across features
+    zero_mask = (work[feature_cols].astype(float).fillna(0) == 0).all(axis=1)
+    work = work.loc[~zero_mask].copy()
     return work, feature_cols
 
 
@@ -341,22 +344,22 @@ def analyze_clusters(
     *,
     method_name: str = "kmeans",
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Attach labels and return (df_clustered, summary).
-    Summary includes: n_items and medians of the two features.
+    """Attach labels and produce summary (n_items + median & mean for each feature).
+
+    Works with arbitrary number of features; DBSCAN noise (-1) retained.
     """
     lab_col = f"{method_name.lower()}_cluster"
     dfc = df_features.copy()
     dfc[lab_col] = labels
 
-    # Handle DBSCAN noise (-1) in grouping, keep order by cluster size
+    agg_map = {"n_items": ("item_number", "nunique")}
+    for c in feature_columns:
+        agg_map[f"median_{c}"] = (c, "median")
+        agg_map[f"mean_{c}"] = (c, "mean")
+
     summary = (
         dfc.groupby(lab_col, dropna=False)
-           .agg(
-               n_items=("item_number", "nunique"),
-               purchase_amount_eur_total=("purchase_amount_eur_total", "median"),
-               quantity_sold_total=("quantity_sold_total", "median"),
-           )
+           .agg(**agg_map)
            .reset_index()
            .sort_values("n_items", ascending=False)
     )
@@ -390,27 +393,34 @@ def plot_cluster_optimization_metrics(optimization: Dict[str, Any]) -> None:
     plt.tight_layout(); plt.show()
 
 
-def plot_feature_scatter(df_clustered: pd.DataFrame, method_name: str = "kmeans") -> None:
-    """
-    Simple 2D scatter in original feature space, colored by cluster.
+def plot_feature_scatter(
+    df_clustered: pd.DataFrame,
+    feature_columns: Optional[List[str]] = None,
+    method_name: str = "kmeans",
+    log_scale: bool = True,
+) -> None:
+    """Scatter plot for first two feature columns.
+
+    If less than 2 features, exits gracefully. Optionally apply log scaling.
     """
     lab_col = f"{method_name.lower()}_cluster"
     if lab_col not in df_clustered.columns:
-        print(f"Cluster column '{lab_col}' not found.")
+        print(f"Cluster column '{lab_col}' not found; cannot plot.")
         return
-
-    x = "purchase_amount_eur_total"
-    y = "quantity_sold_total"
-
+    feature_columns = feature_columns or [c for c in params.CLUSTER_FEATURES]
+    if len(feature_columns) < 2:
+        print("Need at least two features to scatter plot.")
+        return
+    x, y = feature_columns[:2]
     groups = df_clustered.groupby(lab_col)
     plt.figure(figsize=(9, 7))
     for cid, g in groups:
         label = "Noise" if cid == -1 else f"Cluster {cid}"
         plt.scatter(g[x], g[y], s=30, alpha=0.7, label=label)
-
-    plt.xscale("log"); plt.yscale("log")
-    plt.xlabel("Purchase Amount EUR (total)"); plt.ylabel("Quantity Sold (total)")
-    plt.title(f"{method_name.title()} – Feature Scatter (log-log)")
+    if log_scale:
+        plt.xscale("log"); plt.yscale("log")
+    plt.xlabel(x); plt.ylabel(y)
+    plt.title(f"{method_name.title()} – Feature Scatter")
     plt.grid(True, which="both", ls=":", alpha=.3)
     plt.legend()
     plt.tight_layout(); plt.show()

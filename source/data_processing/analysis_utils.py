@@ -56,6 +56,7 @@ DATASET_ID = os.getenv("DATASET_ID", "MadsH")  # <- you asked to use MadsH
 TABLE_ID   = os.getenv("TABLE_ID", "super_table")
 
 SUPER_TABLE_FQN = f"`{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`"
+PURCHASE_DATA_FQN = f"`{PROJECT_ID}.{DATASET_ID}.purchase_data`"  # for optional join (GroupVendorName)
 
 # Core product columns to include (as per your “only include” list)
 PRODUCT_COLS: list[str] = [
@@ -343,6 +344,117 @@ def fetch_super_table(
     # Optional type fixes (if you have product_utils in path)
     if coerce_dtypes:
         df = coerce_dtypes(df)
+    return df
+
+
+def fetch_super_table_filtered(
+    *,
+    class2: Optional[Sequence[str]] = None,
+    class3: Optional[Sequence[str]] = None,
+    brand: Optional[Sequence[str]] = None,
+    group_vendor_name: Optional[Sequence[str]] = None,
+    description_regex: Optional[Sequence[str]] = None,
+    regex_whole_word: bool = True,
+    limit: Optional[int] = None,
+    debug_print_sql: bool = False,
+) -> pd.DataFrame:
+    """Simplified filtered fetch limited to Class2, Class3, Brand, GroupVendorName and regex keywords.
+
+    This focuses on the minimal filter surface you requested and (optionally) joins
+    the purchase_data table only when a GroupVendorName predicate is required.
+
+    Parameters
+    ----------
+    class2, class3, brand : sequence of str, optional
+        Exact match filters (case-sensitive) against columns ``class_2``, ``class_3`` and ``brand_name``.
+    group_vendor_name : sequence of str, optional
+        Exact match filter against GroupVendorName (brought in via purchase_data join if needed).
+    description_regex : sequence of str, optional
+        Regex patterns (combined with OR) matched against ``item_description`` (case-insensitive).
+    regex_whole_word : bool, default True
+        Wrap each pattern with word boundaries ``\b`` if True.
+    limit : int, optional
+        LIMIT clause.
+    debug_print_sql : bool, default False
+        Print the generated SQL before executing.
+
+    Returns
+    -------
+    DataFrame
+        Resulting rows with the base product columns plus GroupVendorName when joined.
+    """
+
+    base_cols = [
+        "item_number", "item_description", "class_2", "class_3", "brand_name",
+        "purchase_amount_eur_2020", "purchase_amount_eur_2021", "purchase_amount_eur_2022", "purchase_amount_eur_2023", "purchase_amount_eur_2024",
+        "quantity_sold_2021", "quantity_sold_2022", "quantity_sold_2023", "quantity_sold_2024",
+    ]
+    select_cols = [c for c in base_cols if c in PRODUCT_COLS]
+
+    needs_gv = bool(group_vendor_name)
+    if needs_gv:
+        select_cols.append("gv.GroupVendorName AS GroupVendorName")
+
+    where_parts: list[str] = []
+    def _in_simple(col: str, values: Optional[Sequence[str]]):
+        if values:
+            esc = ", ".join("'" + str(v).replace("'", "''") + "'" for v in values)
+            where_parts.append(f"{col} IN ({esc})")
+
+    _in_simple("class_2", class2)
+    _in_simple("class_3", class3)
+    _in_simple("brand_name", brand)
+
+    if description_regex:
+        # Build REGEXP predicate combining patterns
+        pats = []
+        for raw in description_regex:
+            if not raw:
+                continue
+            import re as _re
+            esc = _re.escape(raw)
+            if regex_whole_word:
+                esc = rf"\\b{esc}\\b"
+            pats.append(esc)
+        if pats:
+            combined = "|".join(pats)
+            where_parts.append(f"REGEXP_CONTAINS(item_description, r'(?i){combined}')")
+
+    if group_vendor_name:
+        esc = ", ".join("'" + str(v).replace("'", "''") + "'" for v in group_vendor_name)
+        where_parts.append(f"gv.GroupVendorName IN ({esc})")
+
+    where_sql = ""
+    if where_parts:
+        where_sql = "WHERE " + " AND ".join(where_parts)
+
+    join_sql = ""
+    if needs_gv:
+        # Left join purchase_data to surface group vendor name; relies on ProductId key
+        join_sql = f"LEFT JOIN {PURCHASE_DATA_FQN} pd ON pd.ProductId = st.ProductId \nLEFT JOIN {PURCHASE_DATA_FQN} gv_src ON gv_src.ProductId = st.ProductId \nLEFT JOIN {PURCHASE_DATA_FQN} gv2 ON gv2.ProductId = st.ProductId"  # placeholder alternative
+        # Simpler: purchase_data already contains group_vendor_dim; reference alias 'pd'
+        select_cols = [col.replace("gv.GroupVendorName", "pd.group_vendor_dim.GroupVendorName") for col in select_cols]
+        join_sql = f"LEFT JOIN {PURCHASE_DATA_FQN} pd ON pd.ProductId = st.ProductId"
+
+    limit_sql = f"LIMIT {int(limit)}" if (isinstance(limit, int) and limit is not None and limit > 0) else ""
+
+    query = f"""
+    SELECT
+      {', '.join(select_cols)}
+    FROM {SUPER_TABLE_FQN} st
+    {join_sql}
+    {where_sql}
+    {limit_sql}
+    """.strip()
+
+    if debug_print_sql:
+        print("=== FILTER SQL ===")
+        print(query)
+
+    bq = BigQueryConnector()
+    df = bq.query(query)
+    if df is None:
+        return pd.DataFrame()
     return df
 
 

@@ -2,16 +2,16 @@
 clustering_pipeline.py
 ----------------------
 
-Scalable clustering pipeline on tender material using TWO features:
-- purchase_amount_eur_total  (sum of purchase_amount_eur_2020..2024)
-- quantity_sold_total        (sum of quantity_sold_2021..2024)
+Scalable clustering pipeline on tender material (super_table) using TWO features
+derived from yearly columns according to `clustering_params.feature_spec()`:
+    - feat_purchase_amount_eur (strategy: sum|latest|mean on purchase_amount_eur_YYYY)
+    - feat_quantity_sold       (strategy: sum|latest|mean on quantity_sold_YYYY)
 
-Data source (EU):
-  kramp-sharedmasterdata-prd.MadsH.super_table
+Data source (EU): kramp-sharedmasterdata-prd.MadsH.super_table
 
-Filters (SQL-side) respected:
-  class_2 / class_3 / class_4 / brand_name / STEP_CountryOfOrigin / supplier_name_string
-  purchase stop mode: 'strict' (stop_purchase_ind='N'), 'lenient' (!='Y' or null), or None
+Simplified filtering surface (see analysis_utils.fetch_super_table_filtered):
+    class_2 / class_3 / brand_name / GroupVendorName (via purchase_data) / description regex keywords.
+Legacy filters (class_4, country of origin, purchase-stop) are ignored here.
 
 Clustering methods:
   - KMeans
@@ -39,6 +39,15 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans, AgglomerativeClustering, DBSCAN
 from sklearn.metrics import silhouette_score, calinski_harabasz_score
 
+# Simplified filtered fetch + helpers
+try:
+    from source.data_processing.analysis_utils import (
+        fetch_super_table_filtered,
+        compute_totals,
+    )
+except ImportError:
+    from .analysis_utils import fetch_super_table_filtered, compute_totals  # type: ignore
+
 # --- params import (single, authoritative) ---
 try:
     from source.data_processing import clustering_params as params  # absolute within project
@@ -59,107 +68,32 @@ except ImportError:
 
 
 # =============================================================================
-# Helpers - SQL building & data munging
+# Year column helpers (derive from params feature spec)
 # =============================================================================
 
-_PURCHASE_COLS = [
-    "purchase_amount_eur_2020",
-    "purchase_amount_eur_2021",
-    "purchase_amount_eur_2022",
-    "purchase_amount_eur_2023",
-    "purchase_amount_eur_2024",
-]
+def _build_feature_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Create clustering feature columns per params.feature_spec().
 
-_QTY_COLS = [
-    "quantity_sold_2021",
-    "quantity_sold_2022",
-    "quantity_sold_2023",
-    "quantity_sold_2024",
-]
-
-_ORDERS_COLS = [
-    "orders_2021", "orders_2022", "orders_2023", "orders_2024"
-]
-
-_BASE_SELECT_COLS = [
-    "item_number",
-    "item_description",
-    "class_2", "class_3", "class_4",
-    "brand_name",
-    "STEP_CountryOfOrigin",
-    "supplier_name_string",
-    "stop_purchase_ind",
-] + _PURCHASE_COLS + _QTY_COLS + _ORDERS_COLS
-
-
-def _fmt_in(values: Sequence[str]) -> str:
-    # Case-insensitive IN with UPPER() on both sides
-    safe = [v.replace("'", "\\'") for v in values]
-    return "(" + ", ".join([f"'{s.upper()}'" for s in safe]) + ")"
-
-
-def _where_clause() -> str:
-    """Compose WHERE clause from params.* filters + purchase stop mode."""
-    where = []
-
-    # Purchase stop policy
-    mode = (params.PURCHASE_STOP_MODE or "").strip().lower()
-    if mode == "strict":
-        where.append("stop_purchase_ind = 'N'")
-    elif mode == "lenient":
-        where.append("(stop_purchase_ind IS NULL OR UPPER(stop_purchase_ind) != 'Y')")
-    # None -> no purchase-stop filter
-
-    def add_filter(col: str, values: Optional[Sequence[str]]):
-        if values:
-            upper_vals = _fmt_in(values)
-            where.append(f"UPPER({col}) IN {upper_vals}")
-
-    add_filter("class_2", params.CLASS2)
-    add_filter("class_3", params.CLASS3)
-    add_filter("class_4", params.CLASS4)
-    add_filter("brand_name", params.BRAND_NAME)
-    add_filter("STEP_CountryOfOrigin", params.COUNTRY_OF_ORIGIN)
-    add_filter("supplier_name_string", params.GROUP_SUPPLIER)
-    add_filter("item_number", params.ITEM_NUMBERS)
-
-    # Keyword search in description (case-insensitive LIKE)
-    if params.KEYWORDS_IN_DESC:
-        likes = []
-        for kw in params.KEYWORDS_IN_DESC:
-            kw = kw.strip()
-            if kw:
-                likes.append(f"LOWER(item_description) LIKE '%{kw.lower().replace('%','\\%')}%'")
-        if likes:
-            where.append("(" + " OR ".join(likes) + ")")
-
-    return ("WHERE " + " AND ".join(where)) if where else ""
-
-
-def _build_sql(columns: Optional[Sequence[str]] = None, limit: Optional[int] = None) -> str:
-    sel_cols = columns or _BASE_SELECT_COLS
-    select_list = ",\n    ".join(sel_cols)
-    sql = f"""
-SELECT
-    {select_list}
-FROM {params.SUPER_TABLE_FQN}
-{_where_clause()}
-"""
-    if limit and isinstance(limit, int) and limit > 0:
-        sql += f"LIMIT {limit}\n"
-    return sql
-
-
-def _sum_columns(df: pd.DataFrame, cols: Sequence[str]) -> pd.Series:
-    return df.loc[:, [c for c in cols if c in df.columns]].apply(pd.to_numeric, errors="coerce").fillna(0).sum(axis=1)
-
-
-def _coerce_numeric(df: pd.DataFrame, cols: Sequence[str]) -> pd.DataFrame:
-    out = df.copy()
-    for c in cols:
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce")
-    return out
+    Strategies: sum | latest | mean.
+    Missing columns are ignored gracefully.
+    """
+    spec = params.feature_spec()
+    work = df.copy()
+    for feat_name, cfg in spec.items():
+        cols = [c for c in cfg["from"] if c in work.columns]
+        if not cols:
+            work[feat_name] = 0.0
+            continue
+        block = work[cols].apply(pd.to_numeric, errors="coerce")
+        strat = cfg.get("strategy", "sum").lower()
+        if strat == "latest":
+            # last non-null in chronological order
+            work[feat_name] = block.ffill(axis=1).iloc[:, -1].fillna(0)
+        elif strat == "mean":
+            work[feat_name] = block.mean(axis=1, skipna=True).fillna(0)
+        else:  # sum default
+            work[feat_name] = block.sum(axis=1, skipna=True).fillna(0)
+    return work
 
 
 # =============================================================================
@@ -203,7 +137,7 @@ class ClusteringPipeline:
     # internal state
     data: pd.DataFrame | None = None
     features: pd.DataFrame | None = None
-    feature_cols: List[str] = field(default_factory=lambda: ["purchase_amount_eur_total", "quantity_sold_total"])
+    feature_cols: List[str] = field(default_factory=lambda: list(params.CLUSTER_FEATURES))
     X_scaled: np.ndarray | None = None
     scaler: StandardScaler | None = None
     optimization: Dict[str, Any] = field(default_factory=dict)
@@ -212,55 +146,45 @@ class ClusteringPipeline:
     # --------------------------
     # Step 1: Load filtered data
     # --------------------------
-    def load_data(self, *, columns: Optional[Sequence[str]] = None) -> pd.DataFrame:
-        sql = _build_sql(columns=columns, limit=self.row_limit)
-        bq = BigQueryConnector()
-        try:
-            df = bq.query(sql, location=self.bq_location)  # many connectors accept 'location'
-        except TypeError:
-            df = bq.query(sql)  # fallback if your query() doesn't accept location
+    def load_data(self) -> pd.DataFrame:
+        """Fetch filtered super_table slice using simplified filtered fetch.
 
+        Uses params.filtered_fetch_kwargs() and then computes totals for convenience.
+        """
+        kwargs = params.filtered_fetch_kwargs()
+        df = fetch_super_table_filtered(**kwargs)
         if df is None or df.empty:
-            raise ValueError("No data returned from BigQuery with current filters.")
-
-        # Force numeric on year columns we need
-        df = _coerce_numeric(df, _PURCHASE_COLS + _QTY_COLS + _ORDERS_COLS)
+            raise ValueError("No data returned from BigQuery with current simplified filters.")
+        # Add total helper columns (not necessarily used for features but handy for summaries)
+        df = compute_totals(df)
         self.data = df
         return df
 
     # -----------------------------------
     # Step 2: Prepare the two clustering features
     # -----------------------------------
-    def prepare_features(self, *, min_transactions: Optional[int] = params.MIN_TRANSACTIONS,
-                         rounding_filter: Optional[float] = params.ROUNDING_FILTER) -> Tuple[pd.DataFrame, List[str]]:
+    def prepare_features(self, *, min_transactions: Optional[int] = params.MIN_TRANSACTIONS) -> Tuple[pd.DataFrame, List[str]]:
         if self.data is None:
             raise RuntimeError("Call load_data() first.")
-
         df = self.data.copy()
 
-        # Build totals
-        df["purchase_amount_eur_total"] = _sum_columns(df, _PURCHASE_COLS)
-        df["quantity_sold_total"] = _sum_columns(df, _QTY_COLS)
+        # Derive feature columns per spec
+        df = _build_feature_columns(df)
 
-        # Optional: filter by min total orders (proxy for transactions)
-        if min_transactions and any(c in df.columns for c in _ORDERS_COLS):
-            df["orders_total"] = _sum_columns(df, _ORDERS_COLS)
+        # Optional transaction threshold using orders_total if present
+        if min_transactions and "orders_total" in df.columns:
             df = df.loc[df["orders_total"] >= int(min_transactions)].copy()
 
-        # Optional: rounding filter exists in sales tables; your super table may not carry it
-        # Keeping the knob for compatibility; no-op here unless you have a rounding column joined later.
+        # Drop rows where both feature values are zero (no signal)
+        if len(self.feature_cols) == 2:
+            a, b = self.feature_cols
+            df = df.loc[(df[a] > 0) | (df[b] > 0)].copy()
 
-        # Keep only rows with positive signal in either feature (avoid all-zero rows)
-        df = df.loc[(df["purchase_amount_eur_total"] > 0) | (df["quantity_sold_total"] > 0)].copy()
-
-        # Scale features
         feats = df[self.feature_cols].astype(float).fillna(0)
         scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(feats.values)
-
-        self.features = df
-        self.X_scaled = X_scaled
+        self.X_scaled = scaler.fit_transform(feats.values)
         self.scaler = scaler
+        self.features = df
         return df, self.feature_cols
 
     # -------------------------------------------------
@@ -402,5 +326,82 @@ class ClusteringPipeline:
     # -------------------------------------------------
     def _analyze_result(self, labels: np.ndarray, *, method: str, model: Any, n_clusters: int,
                         extra: Optional[Dict] = None) -> Dict[str, Any]:
-        """Analyze clustering results and compute metrics."""
-        pass  # Implementation to be added
+        """Attach labels and compute summary metrics.
+
+        Returns dict with:
+          df_clustered, cluster_summary, silhouette_score (if applicable),
+          calinski_harabasz_score (if applicable), n_clusters, and extras.
+        """
+        if self.features is None:
+            raise RuntimeError("Features not prepared.")
+        lab_col = f"{method.lower()}_cluster"
+        dfc = self.features.copy()
+        dfc[lab_col] = labels
+
+        # Summary (use median for robustness)
+        summary = (
+            dfc.groupby(lab_col, dropna=False)
+               .agg(
+                   n_items=("item_number", "nunique"),
+                   **{f"median_{c}": (c, "median") for c in self.feature_cols},
+                   **{f"mean_{c}": (c, "mean") for c in self.feature_cols},
+               )
+               .reset_index()
+               .sort_values("n_items", ascending=False)
+        )
+
+        # Quality metrics (skip if degenerate or noise-only)
+        sil = None
+        ch = None
+        try:
+            # For DBSCAN include only non-noise points for silhouette if >1 cluster
+            if method.lower() == "dbscan" and (-1 in labels):
+                mask = labels != -1
+                uniq = set(labels[mask])
+                if len(uniq) > 1:
+                    sil = float(silhouette_score(self.X_scaled[mask], labels[mask]))
+                    ch = float(calinski_harabasz_score(self.X_scaled[mask], labels[mask]))
+            else:
+                if n_clusters > 1:
+                    sil = float(silhouette_score(self.X_scaled, labels))
+                    ch = float(calinski_harabasz_score(self.X_scaled, labels))
+        except Exception:
+            sil = None
+            ch = None
+
+        result = dict(
+            df_clustered=dfc,
+            cluster_summary=summary,
+            silhouette_score=sil,
+            calinski_harabasz=ch,
+            n_clusters=n_clusters,
+            feature_columns=self.feature_cols,
+            method=method,
+            extras=extra or {},
+            model_repr=repr(model),
+        )
+        return result
+
+    # -------------------------------------------------
+    # Convenience orchestration
+    # -------------------------------------------------
+    def run_complete_analysis(self, *, include_dbscan: bool | None = None, show_visualizations: bool | None = None) -> Dict[str, Dict[str, Any]]:
+        """Full pipeline shortcut.
+
+        Returns clustering_results dict after running selected methods.
+        """
+        self.load_data()
+        self.prepare_features()
+        self.optimize_clusters()
+
+        include_dbscan = params.INCLUDE_DBSCAN if include_dbscan is None else include_dbscan
+        show_visualizations = params.SHOW_VISUALIZATIONS if show_visualizations is None else show_visualizations
+
+        if self.include_kmeans:
+            self.run_kmeans()
+        if self.include_hierarchical:
+            self.run_hierarchical()
+        if include_dbscan and self.include_dbscan:
+            self.run_dbscan()
+        # (Visualization integration left to external plotting utilities)
+        return self.clustering_results
