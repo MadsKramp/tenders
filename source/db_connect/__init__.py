@@ -1,33 +1,27 @@
-"""
-BigQuery Database Connection Package
+from __future__ import annotations
+import logging
+from importlib.metadata import version as _v, PackageNotFoundError
 
-This package provides easy-to-use connectors for Google BigQuery.
-
-Main Components:
-- BigQueryConnector: Main class for BigQuery operations
-- quick_query: Convenience function for one-off queries
-- get_kramp_fasteners_data: Specific function for Kramp data
-
-Usage:
-    from source.db_connect import BigQueryConnector, quick_query
-    
-    # Use the main connector
-    bq = BigQueryConnector()
-    df = bq.query("SELECT * FROM table")
-    
-    # Or use quick functions
-    df = quick_query("SELECT * FROM table")
-"""
-
-from .bigquery_connector import (
-    BigQueryConnector,
-    quick_query
-)
-
-__version__ = "1.0.0"
-__author__ = "Kramp Data Team"
+# Re-exports: import from `src` instead of deep utils paths
+from .utils.bq import make_client, run_sql
+from .utils.io import read_or_query
+from .utils.validate import expect_columns, expect_non_empty
+from .utils.fe import product_agg_for_clustering
 
 __all__ = [
-    'bigquery_connector',
-    'quick_query', 
+    "make_client",
+    "run_sql",
+    "read_or_query",
+    "expect_columns",
+    "expect_non_empty",
+    "product_agg_for_clustering",
 ]
+
+# Avoid "No handler found" warnings; user configures logging in notebook if desired
+logging.getLogger(__name__).addHandler(logging.NullHandler())
+
+# Optional: version hint (works if you package/install; harmless otherwise)
+try:
+    __version__ = _v("spend-analysis")
+except PackageNotFoundError:
+    __version__ = "0.0.0"

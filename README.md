@@ -11,12 +11,15 @@ Unified Python utilities and SQL scripts for building and analyzing the EU denor
 - Column group constants for yearly metrics (`YEAR_COLUMN_GROUPS`, etc.)
 
 ## Installation / Environment
-Set environment variables (or `.env`) before importing:
+Set environment variables (or `.env`) before importing. For purchase spend analysis the authoritative fully-qualified table id is:
+
 ```
-PROJECT_ID=kramp-sharedmasterdata-prd
-DATASET_ID=MadsH
-TABLE_ID=super_table   # override if physical table name differs
+PURCHASE_TABLE_FQN=kramp-sharedmasterdata-prd.MadsH.purchase_data
+PROJECT_ID=kramp-sharedmasterdata-prd   # optional if you only use PURCHASE_TABLE_FQN
+BQ_LOCATION=EU
 ```
+
+If you instead use separate dataset/table entries, ensure they are not combined incorrectly (avoid setting `PROJECT_ID` to the full table). The notebook now hardcodes `kramp-sharedmasterdata-prd.MadsH.purchase_data` to prevent malformed concatenations like `kramp-sharedmasterdata-prd.MadsH.purchase_data.your_dataset.your_table`.
 
 ## Quick Start (Notebook)
 ```python
