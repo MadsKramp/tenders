@@ -35,65 +35,148 @@ from typing import Dict
 # Core CREATE / DDL scripts (static canonical copies)
 # ---------------------------------------------------------------------------
 
-# Latest purchase_data build (aligned to current sqlScripts/create_purchase_data.sql)
-CREATE_PURCHASE_DATA_SQL: str = r"""CREATE SCHEMA IF NOT EXISTS `kramp-sharedmasterdata-prd.MadsH`;
-
--- 1) Stage sources
-CREATE TEMP TABLE rel AS
-SELECT *
-FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__REL__vendorProductCompany__current`;
-
-CREATE TEMP TABLE v AS
-SELECT *
-FROM `kramp-sharedmasterdata-prd.dbt_cloud_pr_249255_174_1748257232.PRES__DIM__vendor__current`;
-
-CREATE TEMP TABLE gv AS
-SELECT *
-FROM `kramp-sharedmasterdata-prd.dbt_cloud_pr_249255_174_1748257232.PRES__DIM__groupVendor__current`;
-
-CREATE TEMP TABLE cal AS
-SELECT *
-FROM `kramp-purchase-prd.kramp_purchase_presentation.PRES__CAL__PurchasePerProduct`;
-
--- 2) Base join: REL + V + GV
---    REL.VendorId = V.UniqueVendorCode
---    V.GroupVendorId = GV.GroupVendorId
-CREATE TEMP TABLE base AS
-SELECT
-	r.*,
-	(SELECT AS STRUCT v.*)  AS vendor_dim,
-	(SELECT AS STRUCT gv.*) AS group_vendor_dim
-FROM rel r
-LEFT JOIN v
-	ON CAST(r.VendorId AS STRING) = CAST(v.UniqueVendorCode AS STRING)
-LEFT JOIN gv
-	ON v.GroupVendorId = gv.GroupVendorId;
-
--- 3) Final: add CAL on Product + UniqueVendorCode
---    REL.ProductId = CAL.ProductNumber
---    V.UniqueVendorCode = CAL.uniquevendorcode
+# Latest purchase_data build (sourced from sqlScripts/create_purchase_data.sql)
+CREATE_PURCHASE_DATA_SQL: str = r"""-- Clean target
+CREATE SCHEMA IF NOT EXISTS `kramp-sharedmasterdata-prd.MadsH`;
 DROP TABLE IF EXISTS `kramp-sharedmasterdata-prd.MadsH.purchase_data`;
 
+-- First temp table: purchase rows (class2 code 54, post-2020, has main group vendor)
+CREATE TEMP TABLE purchase_data AS
+WITH src AS (
+	SELECT
+		year_authorization,
+		uniquevendorcode,
+		warehouse,
+		ProductNumber,
+		ProductDescription,
+		purchase_amount_eur,
+		purchase_quantity,
+		crm_main_vendor,
+		crm_main_group_vendor,
+		class2,
+		class3,
+		class4,
+		brandName,
+		BrandType,
+		assortmentType,
+		level0,
+		level1,
+		level2,
+		level3,
+		level4,
+		countryOfOrigin,
+		category_manager,
+		supplier_group,
+		procurement_bu,
+		supplier_site_name,
+		supplier_site_status,
+		supplier_profile,
+		supplier_profile_status,
+		supplier_parent,
+		alternate_site_name,
+		procurement_manager,
+		supplier_manager,
+		supplier_specialist,
+		inventory_specialist,
+		purchase_order_specialist,
+		abc_code,
+		category,
+		dutch_windmill,
+		supplier_site_payment_terms,
+		supplier_site_delivery_conditions,
+		supplier_site_country,
+		supplier_site_city,
+		crm_vendor,
+		crm_group_vendor,
+		PLMStatusGlobal,
+		EAN_code,
+		cn_code,
+		contract_type,
+		REGEXP_EXTRACT(class2, r'^\s*(\d+)') AS class2_code
+	FROM `kramp-purchase-prd.kramp_purchase_customquery.CUQ__TBL__DataDive__Purchase`
+)
+SELECT *
+FROM src
+WHERE crm_main_group_vendor IS NOT NULL
+	AND year_authorization > 2020
+	AND class2_code = '54';
+
+-- Second temp table: brand mapping for only class2=54 and allowed PLM statuses
+CREATE TEMP TABLE brand_table AS
+SELECT DISTINCT
+	b.kramp_item_number AS ProductNumber,
+	b.key_brand_identifier
+FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__REL__productBrand__current` AS b
+JOIN (
+	SELECT
+		ProductNumber,
+		PLMStatusGlobal,
+		REGEXP_EXTRACT(class2, r'^\s*(\d+)') AS class2_code
+	FROM `kramp-purchase-prd.kramp_purchase_customquery.CUQ__TBL__DataDive__Purchase`
+) AS p
+	ON CAST(p.ProductNumber AS STRING) = CAST(b.kramp_item_number AS STRING)
+WHERE p.class2_code = '54'
+	AND p.PLMStatusGlobal NOT IN (
+		'600 - Phasing out phase in progress',
+		'700 - Phased out phase in progress',
+		'750 - Phased out phase completed'
+	);
+
+-- Final table: only class2=54 rows plus brand identifier
 CREATE TABLE `kramp-sharedmasterdata-prd.MadsH.purchase_data` AS
 SELECT
-	-- handy top-level keys
-	b.CompanyId,
-	b.ProductId,
-	b.VendorId,
-
-	-- optional: surface a few CAL fields directly
-	c.ProductNumber,
-	c.uniquevendorcode,
-
-	-- keep full payloads nested to avoid column collisions
-	(SELECT AS STRUCT b.* EXCEPT(vendor_dim, group_vendor_dim)) AS vendor_product_company,
-	b.vendor_dim,
-	b.group_vendor_dim,
-	(SELECT AS STRUCT c.*) AS purchase_per_product
-FROM base b
-LEFT JOIN cal c
-	ON CAST(b.ProductId AS STRING)        = CAST(c.ProductNumber    AS STRING)
- AND CAST(b.vendor_dim.UniqueVendorCode AS STRING) = CAST(c.uniquevendorcode AS STRING);"""
+	pd.year_authorization,
+	pd.uniquevendorcode,
+	pd.warehouse,
+	pd.ProductNumber,
+	pd.ProductDescription,
+	pd.purchase_amount_eur,
+	pd.purchase_quantity,
+	pd.crm_main_vendor,
+	pd.crm_main_group_vendor,
+	pd.class2,
+	pd.class3,
+	pd.class4,
+	pd.brandName,
+	pd.BrandType,
+	pd.assortmentType,
+	pd.level0,
+	pd.level1,
+	pd.level2,
+	pd.level3,
+	pd.level4,
+	pd.countryOfOrigin,
+	pd.category_manager,
+	pd.supplier_group,
+	pd.procurement_bu,
+	pd.supplier_site_name,
+	pd.supplier_site_status,
+	pd.supplier_profile,
+	pd.supplier_profile_status,
+	pd.supplier_parent,
+	pd.alternate_site_name,
+	pd.procurement_manager,
+	pd.supplier_manager,
+	pd.supplier_specialist,
+	pd.inventory_specialist,
+	pd.purchase_order_specialist,
+	pd.abc_code,
+	pd.category,
+	pd.dutch_windmill,
+	pd.supplier_site_payment_terms,
+	pd.supplier_site_delivery_conditions,
+	pd.supplier_site_country,
+	pd.supplier_site_city,
+	pd.crm_vendor,
+	pd.crm_group_vendor,
+	pd.PLMStatusGlobal,
+	pd.EAN_code,
+	pd.cn_code,
+	pd.contract_type,
+	bt.key_brand_identifier
+FROM purchase_data AS pd
+LEFT JOIN brand_table AS bt
+	ON CAST(pd.ProductNumber AS STRING) = CAST(bt.ProductNumber AS STRING);"""
 
 CREATE_SUPPLIER_DATA_SQL: str = r"""CREATE SCHEMA IF NOT EXISTS `kramp-sharedmasterdata-prd.MadsH`;
 
@@ -112,7 +195,7 @@ FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__DIM__
 
 CREATE TEMP TABLE cal AS
 SELECT *
-FROM `kramp-purchase-prd.kramp_purchase_presentation.PRES__CAL__PurchasePerProduct`;
+FROM `kramp-sharedmasterdata-prd.MadsH.purchase_data`;
 
 -- 2) Build final table
 DROP TABLE IF EXISTS `kramp-sharedmasterdata-prd.MadsH.supplier_data`;
@@ -150,44 +233,73 @@ LEFT JOIN cal
 
 CREATE_PRODUCT_DATA_SQL: str = r"""CREATE SCHEMA IF NOT EXISTS `kramp-sharedmasterdata-prd.MadsH`;
 
--- Canonical product attribute extraction (aligned to sqlScripts/create_product_data.sql)
--- Stages
+-- 1) Stage sources as temp tables (keeps the final SELECT simple)
 CREATE TEMP TABLE rel AS
-SELECT * FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_customquery.CMQ__product_wholesale`;
-CREATE TEMP TABLE v AS
-SELECT * FROM `kramp-sharedmasterdata-prd.dbt_cloud_pr_258697_428_1739806806.SRC__STEP__Value__latest`;
-CREATE TEMP TABLE gv AS
-SELECT * FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source.SRC__STEP__Attribute__latest`;
-CREATE TEMP TABLE cal AS
-SELECT * FROM `kramp-sharedmasterdata-prd.dbt_cloud_pr_258697_428_1739806806.SRC__STEP__Brick_Attribute_Template__latest`;
-CREATE TEMP TABLE cal AS
-SELECT * FROM `kramp-sharedmasterdata-prd.dbt_cloud_pr_258697_428_1739806806.SRC__STEP__Technical_Item_Classification_Hierarchy__latest`;
+SELECT *
+FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_customquery.CMQ__product_wholesale`;
 
+CREATE TEMP TABLE v AS
+SELECT *
+FROM `kramp-sharedmasterdata-prd.dbt_cloud_pr_258697_428_1739806806.SRC__STEP__Value__latest`;
+
+CREATE TEMP TABLE gv AS
+SELECT *
+FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source.SRC__STEP__Attribute__latest`;
+
+CREATE TEMP TABLE cal AS
+SELECT *
+FROM `kramp-sharedmasterdata-prd.dbt_cloud_pr_258697_428_1739806806.SRC__STEP__Brick_Attribute_Template__latest`;
+
+CREATE TEMP TABLE cal AS
+SELECT *
+FROM `kramp-sharedmasterdata-prd.dbt_cloud_pr_258697_428_1739806806.SRC__STEP__Technical_Item_Classification_Hierarchy__latest`;
+
+-- 2) Build final table
 DROP TABLE IF EXISTS `kramp-sharedmasterdata-prd.MadsH.product_data`;
 
 CREATE TABLE `kramp-sharedmasterdata-prd.MadsH.product_data` AS
-WITH prod_bricks AS (
-  SELECT w.*, h.BrickID
-  FROM t1 AS w
-  LEFT JOIN t5 AS h ON w.product_id = h.GoldenItemID
+WITH
+prod_bricks AS (
+	SELECT
+		p.*, h.BrickID
+	FROM t1 AS p
+	LEFT JOIN t5 AS h
+		ON p.product_id = h.GoldenItemID
 ),
 value_expected AS (
-  SELECT pb.product_id, pb.BrickID, v.ID AS step_id, v.AttributeID, v.Value AS AttributeValue
-  FROM prod_bricks AS pb
-  LEFT JOIN t2 AS v
-    ON v.ID = pb.product_id AND SUBSTR(v.ID, 1, 13) = 'ticGoldenItem'
-  LEFT JOIN t4 AS bat
-    ON bat.BrickID = pb.BrickID AND bat.AttributeID = v.AttributeID
-  WHERE pb.product_id IS NOT NULL
+	SELECT
+		pb.product_id,
+		pb.BrickID,
+		v.ID AS step_id,
+		v.AttributeID,
+		v.Value AS AttributeValue
+	FROM prod_bricks AS pb
+	LEFT JOIN t2 AS v
+		ON v.ID = pb.product_id AND SUBSTR(v.ID, 1, 13) = 'ticGoldenItem'
+	LEFT JOIN t4 AS bat
+		ON bat.BrickID = pb.BrickID AND bat.AttributeID = v.AttributeID
+	WHERE pb.product_id IS NOT NULL
 ),
 value_with_meta AS (
-  SELECT ve.product_id, ve.BrickID, ve.AttributeID,
-         a.Name_ENG AS AttributeName, a.AttributeType, ve.AttributeValue
-  FROM value_expected AS ve
-  LEFT JOIN t3 AS a ON ve.AttributeID = a.ID
-  WHERE ve.AttributeID IS NOT NULL
+	SELECT
+		ve.product_id,
+		ve.BrickID,
+		ve.AttributeID,
+		a.Name_ENG AS AttributeName,
+		a.AttributeType AS AttributeType,
+		ve.AttributeValue
+	FROM value_expected AS ve
+	LEFT JOIN t3 AS a
+		ON ve.AttributeID = a.ID
+	WHERE ve.AttributeID IS NOT NULL
 )
-SELECT product_id, BrickID, AttributeID, AttributeName, AttributeType, AttributeValue
+SELECT
+	product_id,
+	BrickID,
+	AttributeID,
+	AttributeName,
+	AttributeType,
+	AttributeValue
 FROM value_with_meta
 ORDER BY product_id, AttributeName;"""
 
@@ -408,6 +520,8 @@ def _merge_registries() -> Dict[str, str]:
 
 # Initial load
 SQL_SCRIPTS: Dict[str, str] = _merge_registries()
+# Backwards-compat: expose legacy names expected by notebooks
+QUERIES: Dict[str, str] = SQL_SCRIPTS
 
 def reload_sql_registry() -> None:
 	"""Rescan sqlScripts/ and refresh SQL_SCRIPTS in-place."""
@@ -427,6 +541,13 @@ def get_sql(key: str) -> str:
     except KeyError as e:
         raise KeyError(f"Unknown SQL key '{key}'. Available: {sorted(SQL_SCRIPTS)}") from e
 
+def get_query(name: str) -> str:
+	"""Compatibility wrapper mapping to get_sql(name).
+
+	Some notebooks import `get_query` and `QUERIES`. Provide both interfaces.
+	"""
+	return get_sql(name)
+
 __all__ = [
 	# Static canonical SQL
 	"CREATE_PURCHASE_DATA_SQL",
@@ -438,7 +559,9 @@ __all__ = [
 	"UPDATE_PROGRESS_SQL",
 	# Registry helpers
 	"SQL_SCRIPTS",
+	"QUERIES",
 	"get_sql",
+	"get_query",
 	"reload_sql_registry",
 ]
 

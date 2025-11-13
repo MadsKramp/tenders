@@ -44,32 +44,32 @@ def check_dependencies():
     
     try:
         import db_dtypes
-        performance_info.append("OK db-dtypes: Enhanced BigQuery data type handling")
+        performance_info.append("✓ db-dtypes: Enhanced BigQuery data type handling")
     except ImportError:
         missing_deps.append("db-dtypes")
-        performance_info.append("MISSING db-dtypes: BigQuery data types may not convert properly")
+        performance_info.append("✗ db-dtypes: Missing - BigQuery data types may not convert properly")
     
     try:
         import pyarrow
-        performance_info.append("OK PyArrow: Fast data conversion (10-100x faster for large datasets)")
+        performance_info.append("✓ PyArrow: Fast data conversion (10-100x faster for large datasets)")
     except ImportError:
         missing_deps.append("pyarrow")
-        performance_info.append("MISSING PyArrow: Conversion will be significantly slower for large datasets")
+        performance_info.append("✗ PyArrow: Missing - Conversion will be significantly slower for large datasets")
     
     # Always show performance status
-    print("Performance Dependencies Status:")
+    print("📊 Performance Dependencies Status:")
     for info in performance_info:
         print(f"   {info}")
     
     if missing_deps:
         deps_str = ", ".join(missing_deps)
-        print(f"\nWARNING: Install missing dependencies for better performance:")
+        print(f"\n⚠️ Install missing dependencies for better performance:")
         print(f"   pip install {deps_str}")
         if "pyarrow" in missing_deps:
-            print(f"   NOTE: PyArrow is especially important for large datasets!")
+            print(f"   ⭐ PyArrow is especially important for large datasets!")
         print()
     else:
-        print(f"All performance dependencies are installed!\n")
+        print(f"✓ All performance dependencies are installed!\n")
     
     return len(missing_deps) == 0
 
@@ -97,17 +97,8 @@ class BigQueryConnector:
         try:
             print(f"🔧 Initializing BigQuery connector...")
             
-            # PROJECT_ID env var should hold a plain GCP project id (e.g. 'kramp-sharedmasterdata-prd').
-            # Guard against accidental assignment of a table/view FQN.
-            raw_project = project_id or os.getenv('PROJECT_ID')
-            if raw_project and '.' in raw_project:
-                # Heuristic: if contains dots typical of dataset.table path, take first segment as project id.
-                candidate = raw_project.split('.')[0]
-                print(f"[BigQueryConnector] Detected compound project string; using '{candidate}' as project id.")
-                self.project_id = candidate
-            else:
-                self.project_id = raw_project
-            print(self.project_id)
+            self.project_id = project_id or os.getenv('PROJECT_ID')
+            print(self.project_id )
             self.credentials_path = credentials_path or os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
             
             print(f"   Project ID: {self.project_id}")
@@ -561,59 +552,32 @@ def quick_query(sql: str, project_id: Optional[str] = None, use_fast_conversion:
     try:
         print(f"🚀 Quick query execution...")
         bq = BigQueryConnector(project_id=project_id)
-        # use_fast_conversion kept for API compatibility; actual conversion handled internally.
-        return bq.query(sql)
+        return bq.query(sql, use_fast_conversion=use_fast_conversion)
     except Exception as e:
         print(f"✗ Error in quick_query: {e}")
         return None
 
 
-def get_kramp_fasteners_data(limit: int = 1000) -> Optional[pd.DataFrame]:
+def get_kramp_spend_data(limit: int = 1000) -> Optional[pd.DataFrame]:
     """
-    Convenience function to get Kramp fasteners data.
+    Convenience function to get Kramp spend data.
     
     Args:
         limit: Number of rows to retrieve
         
     Returns:
-        pandas.DataFrame with fasteners data
+        pandas.DataFrame with Kramp spend data
     """
     try:
-        print(f"🔩 Getting Kramp fasteners data (limit: {limit})...")
+        print(f"🔩 Getting Kramp spend data (limit: {limit})...")
         sql = f"""
             SELECT *
-            FROM `kramp-sharedmasterdata-prd.fasteners.fasteners`
+            FROM `kramp-sharedmasterdata-prd.MadsH.purchase_data`
             LIMIT {limit}
         """
         return quick_query(sql)
     except Exception as e:
-        print(f"✗ Error in get_kramp_fasteners_data: {e}")
+        print(f"✗ Error in get_kramp_spend_data: {e}")
         return None
-
-
-# -----------------------------------------------------------------------------
-# Additional convenience expected by product_utils
-# -----------------------------------------------------------------------------
-DEFAULT_FQN = "kramp-sharedmasterdata-prd.MadsH.super_table"
-ALT_VIEW_FQN = "kramp-sharedmasterdata-prd.MadsH.super_table_alt_view"
-
-def select_df(sql: str, project_id: Optional[str] = None) -> pd.DataFrame:
-    """Light wrapper returning a DataFrame for the given SQL.
-
-    Parameters
-    ----------
-    sql : str
-        Standard BigQuery SQL query.
-    project_id : Optional[str]
-        Override GCP project id; falls back to env / constructor defaults.
-    """
-    bq = BigQueryConnector(project_id=project_id)
-    df = bq.query(sql)
-    return df if df is not None else pd.DataFrame()
-
-__all__ = [
-    'BigQueryConnector', 'quick_query', 'get_kramp_fasteners_data',
-    'select_df', 'DEFAULT_FQN', 'ALT_VIEW_FQN'
-]
 
 

@@ -9,14 +9,15 @@ Main Components:
 - get_kramp_fasteners_data: Specific function for Kramp data
 
 Usage:
-    from db_connect import BigQueryConnector, quick_query
-
+    from source.db_connect import BigQueryConnector, quick_query
+    
+    # Use the main connector
     bq = BigQueryConnector()
     df = bq.query("SELECT * FROM table")
-
+    
+    # Or use quick functions
     df = quick_query("SELECT * FROM table")
 """
-
 
 from .bigquery_connector import (
     BigQueryConnector,
@@ -27,6 +28,6 @@ __version__ = "1.0.0"
 __author__ = "Kramp Data Team"
 
 __all__ = [
-    'BigQueryConnector',
+    'bigquery_connector',
     'quick_query', 
 ]
