@@ -558,18 +558,18 @@ def quick_query(sql: str, project_id: Optional[str] = None, use_fast_conversion:
         return None
 
 
-def get_kramp_spend_data(limit: int = 1000) -> Optional[pd.DataFrame]:
+def get_kramp_purchase_data(limit: int = 1000) -> Optional[pd.DataFrame]:
     """
-    Convenience function to get Kramp spend data.
+    Convenience function to get Kramp purchase data.
     
     Args:
         limit: Number of rows to retrieve
         
     Returns:
-        pandas.DataFrame with Kramp spend data
+        pandas.DataFrame with purchase data
     """
     try:
-        print(f"🔩 Getting Kramp spend data (limit: {limit})...")
+        print(f"🔩 Getting Kramp purchase data (limit: {limit})...")
         sql = f"""
             SELECT *
             FROM `kramp-sharedmasterdata-prd.MadsH.purchase_data`
@@ -577,7 +577,7 @@ def get_kramp_spend_data(limit: int = 1000) -> Optional[pd.DataFrame]:
         """
         return quick_query(sql)
     except Exception as e:
-        print(f"✗ Error in get_kramp_spend_data: {e}")
+        print(f"✗ Error in get_kramp_purchase_data: {e}")
         return None
 
 
