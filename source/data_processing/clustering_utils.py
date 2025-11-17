@@ -37,32 +37,237 @@ def fetch_clustering_data(
     rounding_filter: Optional[float] = None,
     class3_description: Optional[str] = None,
     product_description: Optional[str] = None,
+    aggregate: bool = True,
 ) -> pd.DataFrame:
-    """Fetch raw clustering data from BigQuery applying optional filters.
+    """Fetch (optionally aggregated) clustering data from BigQuery.
 
-    This signature matches what the object oriented pipeline expects.
-    Filters are applied in pandas after retrieval to keep the query simple
-    (adjust later if performance requires server‑side filtering).
+    Performance optimization: by default we aggregate at product level inside BigQuery
+    to dramatically reduce row count and network transfer. The aggregation produces
+    the columns expected by downstream feature preparation:
+
+      - purchase_amount_eur (AVG of raw purchase_amount_eur)
+      - purchase_quantity (SUM of raw purchase_quantity)
+      - total_transactions (COUNT of rows per product)
+      - total_spend (SUM of purchase_amount_eur)
+      - avg_purchase_amount_eur (AVG of purchase_amount_eur)
+      - std_purchase_amount_eur (STDDEV of purchase_amount_eur)
+      - purchase_count (COUNT, alias of total_transactions)
+      - avg_unit_price (total_spend / total_quantity)
+    - year_authorization (MIN year as representative)
+    - crm_main_group_vendor (ANY_VALUE)
+    - ProductNumber, ProductDescription, class3 retained (ANY_VALUE) for filtering/export.
+
+    If aggregate is False the function performs a raw SELECT * (legacy behavior).
+    Server-side WHERE clauses applied when possible to reduce scanned data volume.
     """
     print("Fetching clustering data from BigQuery...")
     bq_client = BigQueryConnector()
-    query = f"SELECT * FROM `{PUrchase_data_table}`"
+
+    where_clauses = []
+    # Apply filter predicates before aggregation when possible
+    if class3_description:
+        # Use case-insensitive match on underlying column name 'class3'
+        where_clauses.append(f"LOWER(class3) LIKE '%{class3_description.lower()}%'")
+    if product_description:
+        where_clauses.append(f"LOWER(ProductDescription) LIKE '%{product_description.lower()}%'")
+    if rounding_filter is not None:
+        where_clauses.append(f"Rounding >= {rounding_filter}")
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+    if aggregate:
+        # Aggregated query
+        query = f"""
+        SELECT
+          ProductNumber,
+          ANY_VALUE(crm_main_group_vendor) AS crm_main_group_vendor,
+          COUNT(*) AS total_transactions,
+          COUNT(*) AS purchase_count,
+          SUM(CAST(purchase_amount_eur AS FLOAT64)) AS total_spend,
+          AVG(CAST(purchase_amount_eur AS FLOAT64)) AS avg_purchase_amount_eur,
+          STDDEV_POP(CAST(purchase_amount_eur AS FLOAT64)) AS std_purchase_amount_eur,
+          AVG(CAST(purchase_amount_eur AS FLOAT64)) AS purchase_amount_eur,
+          SUM(CAST(purchase_quantity AS FLOAT64)) AS purchase_quantity,
+          SAFE_DIVIDE(SUM(CAST(purchase_amount_eur AS FLOAT64)), NULLIF(SUM(CAST(purchase_quantity AS FLOAT64)),0)) AS avg_unit_price,
+          MIN(year_authorization) AS year_authorization,
+          ANY_VALUE(ProductDescription) AS ProductDescription,
+          ANY_VALUE(class3) AS class3
+        FROM `{PUrchase_data_table}`
+        {where_sql}
+        GROUP BY ProductNumber
+        """
+    else:
+        # Raw query
+        query = f"SELECT * FROM `{PUrchase_data_table}` {where_sql}".strip()
+
     df = bq_client.query(query)
     if df is None:
-        raise RuntimeError("BigQuery query returned no results; check credentials and table access.")
+        raise RuntimeError(
+            "BigQuery query failed (returned None). Verify column names (e.g., 'class3'), project/dataset/table, and credentials."
+        )
+    if df.empty:
+        print("⚠️ Query returned 0 rows. Adjust filters or confirm data availability.")
 
-    # Defensive: only apply filters if the columns exist
+    # Post-aggregation filtering by min_transactions if column present
     if 'total_transactions' in df.columns and min_transactions:
+        before = len(df)
         df = df[df['total_transactions'] >= min_transactions]
-    if rounding_filter is not None and 'Rounding' in df.columns:
-        df = df[df['Rounding'] >= rounding_filter]
-    if class3_description and 'Class3Description' in df.columns:
-        df = df[df['Class3Description'].str.contains(class3_description, case=False, na=False)]
-    if product_description and 'ProductDescription' in df.columns:
-        df = df[df['ProductDescription'].str.contains(product_description, case=False, na=False)]
+        print(f"   Applied min_transactions filter ({min_transactions}) → {len(df)} rows (was {before})")
 
-    print(f"✅ Retrieved {len(df)} records after filter application")
+    print(f"✅ Retrieved {len(df)} product-level records" if aggregate else f"✅ Retrieved {len(df)} raw records")
     return df
+
+def build_pattern_features(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """Build purchase quantity distribution pattern features (pct_qty_*) at product level.
+
+    Requires raw transactional rows containing at least:
+      - ProductNumber
+      - purchase_quantity
+      - purchase_amount_eur
+
+    Returns enriched product-level DataFrame with original aggregated metrics plus
+    percentage columns representing the share of transactions falling in predefined
+    purchase_quantity bins.
+    """
+    required = {"ProductNumber", "purchase_quantity", "purchase_amount_eur"}
+    missing = required - set(df_raw.columns)
+    if missing:
+        raise ValueError(f"Cannot build pattern features, missing columns: {missing}")
+
+    # Defensive numeric coercion
+    for col in ["purchase_quantity", "purchase_amount_eur"]:
+        df_raw[col] = pd.to_numeric(df_raw[col], errors="coerce")
+    df_raw = df_raw.dropna(subset=["purchase_quantity", "purchase_amount_eur"])
+
+    # Define quantity bins (adjust as needed for domain)
+    qty_bins = [0, 1, 5, 10, 25, 50, 100, 500, 10**9]
+    qty_labels = [
+        "1", "2_5", "6_10", "11_25", "26_50", "51_100", "101_500", "500_plus"
+    ]
+    df_raw["_qty_bin"] = pd.cut(
+        df_raw["purchase_quantity"], bins=qty_bins, labels=qty_labels, include_lowest=True, right=True
+    )
+
+    # Aggregate core metrics
+    agg = df_raw.groupby("ProductNumber").agg(
+        total_spend=("purchase_amount_eur", "sum"),
+        avg_purchase_amount_eur=("purchase_amount_eur", "mean"),
+        std_purchase_amount_eur=("purchase_amount_eur", "std"),
+        total_transactions=("purchase_amount_eur", "count"),
+        purchase_quantity=("purchase_quantity", "sum"),
+        purchase_amount_eur=("purchase_amount_eur", "mean"),  # For single-column clustering
+        year_authorization=("year_authorization", "min"),
+        crm_main_group_vendor=("crm_main_group_vendor", "first"),
+        ProductDescription=("ProductDescription", "first"),
+        class3=("class3", "first"),
+    ).reset_index()
+    agg["purchase_count"] = agg["total_transactions"]
+    # avg unit price guard
+    agg["avg_unit_price"] = agg.apply(
+        lambda r: (r["total_spend"] / r["purchase_quantity"]) if r["purchase_quantity"] else 0.0,
+        axis=1,
+    )
+    agg["std_purchase_amount_eur"].fillna(0, inplace=True)
+
+    # Build quantity distribution counts
+    qty_counts = (
+        df_raw.groupby(["ProductNumber", "_qty_bin"])["purchase_quantity"].size().unstack(fill_value=0)
+    )
+    # Ensure all labels present
+    for lbl in qty_labels:
+        if lbl not in qty_counts.columns:
+            qty_counts[lbl] = 0
+    qty_counts = qty_counts[qty_labels]
+    qty_counts.reset_index(inplace=True)
+
+    # Merge counts with main aggregation
+    merged = pd.merge(agg, qty_counts, on="ProductNumber", how="left")
+
+    # Percentages (quantity)
+    for lbl in qty_labels:
+        col_count = lbl
+        pct_col = f"pct_qty_{lbl}"
+        merged[pct_col] = (
+            merged[col_count] / merged["total_transactions"] * 100.0
+            if "total_transactions" in merged.columns
+            else 0.0
+        )
+    # Drop raw count bin columns (retain only percentages)
+    merged.drop(columns=qty_labels, inplace=True)
+
+    # ------------------------------------------------------------------
+    # Purchase amount EUR distribution (pct_purchase_amount_eur_*)
+    # ------------------------------------------------------------------
+    try:
+        from . import clustering_params as params
+        enable_value_patterns = getattr(params, 'INCLUDE_VALUE_PATTERN_FEATURES', False)
+    except Exception:
+        enable_value_patterns = False
+
+    if enable_value_patterns and 'purchase_amount_eur' in df_raw.columns:
+        # Compute global quantile edges for purchase_amount_eur to create consistent bins
+        value_series = pd.to_numeric(df_raw['purchase_amount_eur'], errors='coerce').dropna()
+        if len(value_series) >= 50:  # require minimal data for stable quantiles
+            quantile_points = [0.0, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 1.0]
+        else:
+            # Fallback fewer bins for small data
+            quantile_points = [0.0, 0.25, 0.50, 0.75, 1.0]
+        edges = value_series.quantile(quantile_points).values
+        # Ensure strictly increasing (remove duplicates that can arise with constant values)
+        edges_unique = []
+        for v in edges:
+            if not edges_unique or v > edges_unique[-1]:
+                edges_unique.append(v)
+        if len(edges_unique) < 2:
+            # Not enough variation for binning; create single bucket
+            df_raw['_val_bin'] = 'all'
+            val_labels = ['all']
+        else:
+            # Generate readable labels based on edge ranges
+            val_labels = []
+            for i in range(len(edges_unique)-1):
+                low = edges_unique[i]
+                high = edges_unique[i+1]
+                if i == 0:
+                    label = f"<= {high:,.0f}"
+                elif i == len(edges_unique)-2:
+                    label = f"> {low:,.0f}"
+                else:
+                    label = f"{low:,.0f}-{high:,.0f}"
+                val_labels.append(label.replace(',',''))
+            # Use pandas cut with edges_unique
+            df_raw['_val_bin'] = pd.cut(
+                value_series.reindex(df_raw.index, fill_value=np.nan),
+                bins=[edges_unique[0]] + edges_unique[1:],
+                labels=val_labels,
+                include_lowest=True,
+                right=True
+            )
+        # Count occurrences per product per value bin
+        val_counts = (
+            df_raw.groupby(['ProductNumber', '_val_bin'])['purchase_amount_eur'].size().unstack(fill_value=0)
+            if '_val_bin' in df_raw.columns else pd.DataFrame()
+        )
+        if not val_counts.empty:
+            # Ensure all labels present
+            for lbl in val_labels:
+                if lbl not in val_counts.columns:
+                    val_counts[lbl] = 0
+            val_counts = val_counts[val_labels]
+            val_counts.reset_index(inplace=True)
+            merged = pd.merge(merged, val_counts, on='ProductNumber', how='left')
+            # Compute percentages
+            for lbl in val_labels:
+                pct_col = f"pct_purchase_amount_eur_{lbl.replace(' ','_').replace('>','gt').replace('<=','le') }"
+                merged[pct_col] = (
+                    merged[lbl] / merged['total_transactions'] * 100.0
+                    if 'total_transactions' in merged.columns and lbl in merged.columns else 0.0
+                )
+            # Drop raw count columns
+            merged.drop(columns=val_labels, inplace=True, errors='ignore')
+        # Clean temporary column
+        if '_val_bin' in df_raw.columns:
+            df_raw.drop(columns=['_val_bin'], inplace=True, errors='ignore')
+    return merged
 
 # Get centralized clustering parameters with paramters
 def get_clustering_params() -> Dict[str, Any]:
@@ -100,13 +305,13 @@ def prepare_clustering_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[st
         'crm_main_group_vendor',
         'purchase_amount_eur',
         'purchase_quantity',
-        'authorization_year',
+        'year_authorization',
     ]
     pattern_cols = [c for c in requested_pattern_cols if c in df.columns]
     base_cols = [
         c for c in [
             'avg_purchase_amount_eur', 'std_purchase_amount_eur', 'purchase_count',
-            'total_transactions', 'total_turnover', 'avg_unit_price'
+            'total_transactions', 'total_spend', 'avg_unit_price'
         ] if c in df.columns
     ]
     dimension_cols = [
@@ -114,10 +319,77 @@ def prepare_clustering_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[st
         if c in df.columns
     ]
     feature_cols = pattern_cols + base_cols + dimension_cols
+    # Optionally include pattern percentage columns if built
+    try:
+        from . import clustering_params as params
+        # Quantity pattern percentages
+        if getattr(params, 'INCLUDE_PATTERN_FEATURES', False):
+            pct_cols = [c for c in df.columns if c.startswith('pct_qty_')]
+            for c in pct_cols:
+                if c not in feature_cols:
+                    feature_cols.append(c)
+        # Purchase amount EUR pattern percentages
+        if getattr(params, 'INCLUDE_VALUE_PATTERN_FEATURES', False):
+            val_pct_cols = [c for c in df.columns if c.startswith('pct_purchase_amount_eur_')]
+            for c in val_pct_cols:
+                if c not in feature_cols:
+                    feature_cols.append(c)
+    except Exception:
+        pass
     if not feature_cols:
         raise ValueError("No usable feature columns found for clustering.")
     features = df[feature_cols].copy()
-    return features, feature_cols
+
+    # --- Stable numeric coercion & validation ---
+    numeric_candidates = [
+        'purchase_amount_eur','purchase_quantity','year_authorization',
+        'avg_purchase_amount_eur','std_purchase_amount_eur','purchase_count',
+        'total_transactions','total_spend','avg_unit_price',
+        'length_mm','diameter_mm','thread_pitch_mm','length','diameter','thread_pitch'
+    ]
+    pre_dtypes = features.dtypes.to_dict()
+    for col in numeric_candidates:
+        if col in features.columns and col != 'crm_main_group_vendor' and features[col].dtype == object:
+            features[col] = pd.to_numeric(features[col], errors='coerce')
+
+    # Drop columns that became entirely NaN after coercion (likely non-numeric strings)
+    all_nan_cols = [c for c in features.columns if features[c].isna().all()]
+    if all_nan_cols:
+        print(f"⚠️ Dropping entirely NaN columns after coercion: {', '.join(all_nan_cols)}")
+        features.drop(columns=all_nan_cols, inplace=True)
+
+    numeric_cols = list(features.select_dtypes(include=[np.number]).columns)
+    if len(numeric_cols) == 0:
+        raise ValueError(
+            "No numeric feature columns available after coercion. "
+            f"Original dtypes: {pre_dtypes}. Present columns: {features.columns.tolist()}"
+        )
+    if len(numeric_cols) < 2:
+        print(f"⚠️ Only {len(numeric_cols)} numeric column detected; clustering quality may be poor.")
+
+    # Human-readable labels (do not modify original column names here to avoid breaking downstream logic)
+    COLUMN_LABELS = {
+        'crm_main_group_vendor': 'Group Vendor',
+        'purchase_amount_eur': 'Purchase Amount (EUR)',
+        'purchase_quantity': 'Purchase Quantity',
+        'year_authorization': 'Authorization Year',
+        'avg_purchase_amount_eur': 'Avg Purchase Amount (EUR)',
+        'std_purchase_amount_eur': 'Std Purchase Amount (EUR)',
+        'purchase_count': 'Purchase Count',
+        'total_transactions': 'Total Transactions',
+        'total_spend': 'Total Spend',
+        'avg_unit_price': 'Avg Unit Price',
+        'length_mm': 'Length (mm)',
+        'diameter_mm': 'Diameter (mm)',
+        'thread_pitch_mm': 'Thread Pitch (mm)',
+        'length': 'Length',
+        'diameter': 'Diameter',
+        'thread_pitch': 'Thread Pitch'
+    }
+    feature_labels = {c: COLUMN_LABELS.get(c, c.replace('_', ' ').title()) for c in features.columns}
+    features.attrs['feature_labels'] = feature_labels
+    features.attrs['numeric_feature_columns'] = numeric_cols
+    return features, list(features.columns)
 
 def scale_features(features: pd.DataFrame, feature_columns: Optional[List[str]] = None) -> Tuple[np.ndarray, StandardScaler]:
     """
@@ -130,8 +402,13 @@ def scale_features(features: pd.DataFrame, feature_columns: Optional[List[str]] 
         Tuple[np.ndarray, StandardScaler]: Scaled feature array and fitted scaler.
     """
     print("Scaling features...")
+    # Automatically exclude non-numeric columns (e.g., vendor strings) from scaling
+    numeric_features = features.select_dtypes(include=[np.number])
+    excluded = set(features.columns) - set(numeric_features.columns)
+    if excluded:
+        print(f"⚠️ Excluding non-numeric columns from scaling: {', '.join(sorted(excluded))}")
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(features)
+    X_scaled = scaler.fit_transform(numeric_features)
     return X_scaled, scaler
 
 def find_optimal_clusters(X: np.ndarray, max_clusters: int = 10, min_clusters: int = 2, random_state: int = 42) -> Dict[str, Any]:
@@ -451,28 +728,25 @@ def analyze_clusters(df: pd.DataFrame, cluster_labels: np.ndarray, feature_colum
     
     for cluster_id in unique_clusters:
         cluster_data = df_clustered[df_clustered[f'{cluster_method.lower()}_cluster'] == cluster_id]
-        
-        # Special handling for DBSCAN noise points (cluster_id = -1)
         cluster_label = "Noise/Outliers" if cluster_id == -1 else f"Cluster {cluster_id}"
-        
         summary = {
             'cluster_id': cluster_id,
             'cluster_label': cluster_label,
             'cluster_method': cluster_method,
             'n_products': len(cluster_data),
-            'avg_total_transactions': cluster_data['total_transactions'].mean(),
-            'avg_total_turnover': cluster_data['total_turnover'].mean(),
-            'avg_unit_price': cluster_data['avg_unit_price'].mean(),
-            
         }
-        
-        # Add top purchase patterns for this cluster
-        purchase_pattern_cols = [col for col in feature_columns if col.startswith('pct_qty_')]
+        # Optional metrics – only include if present (prevents KeyError when columns were pruned)
+        for col, key in [
+            ('total_transactions', 'avg_total_transactions'),
+            ('total_spend', 'avg_total_spend'),
+            ('avg_unit_price', 'avg_unit_price'),
+            ('purchase_amount_eur', 'avg_purchase_amount_eur'),
+        ]:
+            summary[key] = cluster_data[col].mean() if col in cluster_data.columns else np.nan
+        # Purchase pattern percentages if available
+        purchase_pattern_cols = [c for c in feature_columns if c.startswith('pct_qty_') and c in cluster_data.columns]
         for col in purchase_pattern_cols:
             summary[f'avg_{col}'] = cluster_data[col].mean()
-        
-        
-        
         cluster_summary.append(summary)
     
     cluster_summary_df = pd.DataFrame(cluster_summary)
@@ -540,44 +814,66 @@ def plot_cluster_visualization(X_scaled: np.ndarray, cluster_labels: np.ndarray,
         method_name: Name of clustering method
         figsize: Figure size for the plots
     """
-    # PCA for 2D visualization
+    # Handle single-feature case: provide 1D visualizations instead of PCA
+    if X_scaled.shape[1] < 2:
+        fig, axes = plt.subplots(2, 2, figsize=figsize)
+        # 1D scatter (strip) plot of the single feature
+        x_vals = X_scaled[:, 0]
+        scatter = axes[0, 0].scatter(x_vals, np.zeros_like(x_vals), c=cluster_labels, cmap='viridis', alpha=0.7)
+        axes[0, 0].set_title(f'{method_name} Clusters (Single Feature)')
+        axes[0, 0].set_xlabel('Standardized Feature Value')
+        axes[0, 0].set_yticks([])
+        plt.colorbar(scatter, ax=axes[0, 0])
+        # Histogram per cluster
+        unique_clusters = sorted(pd.Series(cluster_labels).unique())
+        for cid in unique_clusters:
+            mask = cluster_labels == cid
+            axes[0, 1].hist(x_vals[mask], bins=30, alpha=0.5, label=f'C{cid}')
+        axes[0, 1].set_title('Value Distribution by Cluster')
+        axes[0, 1].set_xlabel('Standardized Value')
+        axes[0, 1].legend()
+        # Boxplot per cluster
+        box_data = [x_vals[cluster_labels == cid] for cid in unique_clusters]
+        axes[1, 0].boxplot(box_data, labels=[f'C{cid}' for cid in unique_clusters])
+        axes[1, 0].set_title('Cluster Value Boxplots')
+        axes[1, 0].set_xlabel('Cluster')
+        axes[1, 0].set_ylabel('Standardized Value')
+        # Cluster size distribution
+        cluster_counts = pd.Series(cluster_labels).value_counts().sort_index()
+        axes[1, 1].bar(cluster_counts.index, cluster_counts.values, color=plt.cm.viridis(cluster_counts.index / max(cluster_counts.index.max(),1)))
+        axes[1, 1].set_title('Cluster Size Distribution')
+        axes[1, 1].set_xlabel('Cluster ID')
+        axes[1, 1].set_ylabel('Number of Products')
+        plt.tight_layout()
+        plt.show()
+        return
+
+    # Standard (multi-feature) visualization path using PCA
     pca = PCA(n_components=2, random_state=42)
     X_pca = pca.fit_transform(X_scaled)
-    
-    # Calculate explained variance
     explained_var = pca.explained_variance_ratio_
-    
     fig, axes = plt.subplots(2, 2, figsize=figsize)
-    
-    # PCA scatter plot
     scatter = axes[0, 0].scatter(X_pca[:, 0], X_pca[:, 1], c=cluster_labels, cmap='viridis', alpha=0.7)
     axes[0, 0].set_title(f'{method_name} Clusters (PCA Projection)')
     axes[0, 0].set_xlabel(f'PC1 ({explained_var[0]:.1%} variance)')
     axes[0, 0].set_ylabel(f'PC2 ({explained_var[1]:.1%} variance)')
     plt.colorbar(scatter, ax=axes[0, 0])
-    
-    # Cluster vs Total Transactions
     axes[0, 1].scatter(df['total_transactions'], df['avg_unit_price'], c=cluster_labels, cmap='viridis', alpha=0.7)
     axes[0, 1].set_title(f'{method_name} Clusters: Transactions vs Unit Price')
     axes[0, 1].set_xlabel('Total Transactions')
     axes[0, 1].set_ylabel('Average Unit Price (EUR)')
     axes[0, 1].set_xscale('log')
     axes[0, 1].set_yscale('log')
-    
-    # Cluster vs Rounding
-    axes[1, 0].scatter(df['Rounding'], df['total_turnover'], c=cluster_labels, cmap='viridis', alpha=0.7)
-    axes[1, 0].set_title(f'{method_name} Clusters: Rounding vs Total Turnover')
+    axes[1, 0].scatter(df['Rounding'], df['total_spend'], c=cluster_labels, cmap='viridis', alpha=0.7)
+    axes[1, 0].set_title(f'{method_name} Clusters: Rounding vs Total Spend')
     axes[1, 0].set_xlabel('Rounding')
-    axes[1, 0].set_ylabel('Total Turnover (EUR)')
+    axes[1, 0].set_ylabel('Total Spend (EUR)')
     axes[1, 0].set_yscale('log')
-    
-    # Cluster size distribution
     cluster_counts = pd.Series(cluster_labels).value_counts().sort_index()
-    axes[1, 1].bar(cluster_counts.index, cluster_counts.values, color=plt.cm.viridis(cluster_counts.index / cluster_counts.index.max()))
+    axes[1, 1].bar(cluster_counts.index, cluster_counts.values, color=plt.cm.viridis(cluster_counts.index / max(cluster_counts.index.max(),1)))
     axes[1, 1].set_title(f'{method_name} Cluster Size Distribution')
     axes[1, 1].set_xlabel('Cluster ID')
     axes[1, 1].set_ylabel('Number of Products')
-    
     plt.tight_layout()
     plt.show()
 
@@ -643,27 +939,74 @@ def plot_purchase_patterns_by_cluster(
     plt.show()
 
 def plot_cluster_value_heatmap(df_clustered: pd.DataFrame, cluster_method: str = "kmeans"):
+    """Enhanced heatmap of average transaction distribution percentages by cluster.
+
+    Uses custom styling, improved labeling, and prints quick insights.
     """
-    Plot heatmap showing distribution of transactions per purchase value size mapping for each cluster.
-    
-    Args:
-        df_clustered: DataFrame with cluster assignments and purchase pattern percentages
-        cluster_method: Name of clustering method (for column naming)
-    """
-    cluster_col = f'{cluster_method.lower()}_cluster'
-    purchase_pattern_cols = [col for col in df_clustered.columns if col.startswith('pct_qty_')]
-    
-    heatmap_data = df_clustered.groupby(cluster_col)[purchase_pattern_cols].mean()
-    if heatmap_data.empty:
+    cluster_col = f"{cluster_method.lower()}_cluster"
+    if cluster_col not in df_clustered.columns:
+        print(f"⚠️ Cluster column '{cluster_col}' not found; skipping heatmap.")
+        return
+    # Prefer purchase amount EUR distribution if available, else quantity
+    value_pattern_cols = [c for c in df_clustered.columns if c.startswith("pct_purchase_amount_eur_")]
+    purchase_pattern_cols = [c for c in df_clustered.columns if c.startswith("pct_qty_")]
+    chosen_cols = value_pattern_cols if value_pattern_cols else purchase_pattern_cols
+    if not chosen_cols:
+        print("⚠️ No pattern percentage columns found; skipping heatmap.")
+        return
+    cluster_patterns = df_clustered.groupby(cluster_col)[chosen_cols].mean()
+    if cluster_patterns.empty:
         print("⚠️ No data for heatmap.")
         return
-    plt.figure(figsize=(12, 6))
-    sns.heatmap(heatmap_data, annot=True, fmt=".1f", cmap="YlGnBu")
-    plt.title(f"Purchase Pattern Heatmap by {cluster_method.title()} Clusters")
-    plt.xlabel("Purchase Quantity Categories")
-    plt.ylabel("Cluster ID")
+
+    # Clean column names for display (remove prefix and prettify underscores)
+    if value_pattern_cols:
+        clean_col_names = [c.replace("pct_purchase_amount_eur_", "").replace("le","≤").replace("gt","≥").replace("_"," ") for c in chosen_cols]
+    else:
+        clean_col_names = [c.replace("pct_qty_", "").replace("_", "-") for c in chosen_cols]
+    cluster_patterns.columns = clean_col_names
+
+    # Dynamic axis/title logic based on pattern type
+    if value_pattern_cols:
+        title_line2 = f"{cluster_method.title()} Clustering - Percentage of Transactions per Purchase Value Category"
+        x_axis_label = "Purchase Values"
+    else:
+        title_line2 = f"{cluster_method.title()} Clustering - Percentage of Transactions per Quantity Category"
+        x_axis_label = "Quantity Categories"
+
+    plt.figure(figsize=(14, 7))
+    sns.heatmap(
+        cluster_patterns,
+        annot=True,
+        fmt=".1f",
+        cmap="YlOrRd",
+        cbar_kws={"label": "Percentage of Transactions (%)"},
+        linewidths=0.5,
+        linecolor="white",
+    )
+    plt.title(
+        f"Transaction Distribution Heatmap by Cluster\n{title_line2}",
+        fontsize=14,
+        fontweight="bold",
+        pad=20,
+    )
+    plt.xlabel(x_axis_label, fontsize=12, fontweight="bold")
+    plt.ylabel("Cluster ID", fontsize=12, fontweight="bold")
+    plt.xticks(rotation=45, ha="right")
+    plt.yticks(rotation=0)
     plt.tight_layout()
     plt.show()
+
+    # Insights
+    print("\n🔍 Heatmap Insights:")
+    print(f"   Total clusters analyzed: {len(cluster_patterns)}")
+    category_label = "Purchase values" if value_pattern_cols else "Quantity"
+    print(f"   {category_label} categories: {len(clean_col_names)}")
+    top_per_cluster = cluster_patterns.idxmax(axis=1)
+    for cid, cat in top_per_cluster.items():
+        val = cluster_patterns.loc[cid, cat]
+        print(f"   Cluster {cid}: highest share in '{cat}' ({val:.1f}%)")
+    return cluster_patterns
 
 def plot_dbscan_analysis(X: np.ndarray, cluster_labels: np.ndarray, df: pd.DataFrame, 
                         eps: float, min_samples: int, figsize: Tuple[int, int] = (15, 10)):
@@ -821,6 +1164,16 @@ def save_clustering_results(df_clustered: pd.DataFrame, cluster_summary: pd.Data
     clustered_filename = f'clustering_results{rounding_suffix}_{timestamp}.xlsx'
     summary_filename = f'cluster_summary{rounding_suffix}_{timestamp}.xlsx'
     print(f"💾 Saving clustering results to {clustered_filename} and {summary_filename}...")
-    df_clustered.to_excel(clustered_filename, index=False)
-    cluster_summary.to_excel(summary_filename, index=False)
-    return clustered_filename, summary_filename
+    try:
+        df_clustered.to_excel(clustered_filename, index=False)
+        cluster_summary.to_excel(summary_filename, index=False)
+        return clustered_filename, summary_filename
+    except ModuleNotFoundError as e:
+        # Graceful fallback to CSV if Excel engine missing
+        print(f"⚠️ Excel export failed ({e}); falling back to CSV.")
+        clustered_csv = clustered_filename.replace('.xlsx', '.csv')
+        summary_csv = summary_filename.replace('.xlsx', '.csv')
+        df_clustered.to_csv(clustered_csv, index=False)
+        cluster_summary.to_csv(summary_csv, index=False)
+        print(f"✅ Saved clustering results as CSV: {clustered_csv}, {summary_csv}")
+        return clustered_csv, summary_csv

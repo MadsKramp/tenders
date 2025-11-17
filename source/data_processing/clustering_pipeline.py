@@ -41,6 +41,15 @@ from .clustering_utils import (
     save_clustering_results,
     save_clustering_results_bq,
 )
+from .abc_segmentation import (
+    compute_abc_tiers,
+    compute_kmeans_tiers,
+    compute_gmm_tiers,
+    summarize_tiers,
+)
+
+from sklearn.cluster import MiniBatchKMeans
+from sklearn.decomposition import PCA
 
 from . import clustering_params as params
 
@@ -64,7 +73,10 @@ class ClusteringPipeline:
     features: Optional[pd.DataFrame] = field(default=None, repr=False)
     feature_columns: Optional[List[str]] = field(default=None, repr=False)
     X_scaled: Optional[np.ndarray] = field(default=None, repr=False)
+    X_for_clustering: Optional[np.ndarray] = field(default=None, repr=False)  # Possibly PCA-reduced matrix
     scaler: Any = field(default=None, repr=False)
+    pca_model: Any = field(default=None, repr=False)
+    sampled_indices: Optional[np.ndarray] = field(default=None, repr=False)
 
     # Results containers
     optimization_results: Dict[str, Any] = field(default_factory=dict)
@@ -108,11 +120,19 @@ class ClusteringPipeline:
     # Steps
     def load_data(self) -> None:
         print("📥 Loading data...")
+        # Decide aggregation based on pattern feature requirement
+        aggregate = not params.INCLUDE_PATTERN_FEATURES
         self.data = fetch_clustering_data(
             min_transactions=self.min_transactions,
             class3_description=self.class3_description,
             product_description=self.product_description,
+            aggregate=aggregate,
         )
+        if params.INCLUDE_PATTERN_FEATURES:
+            from .clustering_utils import build_pattern_features
+            print("🔨 Building purchase pattern percentage features (pct_qty_*) from raw data...")
+            self.data = build_pattern_features(self.data)
+            print(f"✅ Pattern features added. Columns now: {len(self.data.columns)} (including pct_qty_*)")
         self._data_loaded = True
         print(f"✅ Data loaded with {len(self.data)} records.")
 
@@ -122,7 +142,99 @@ class ClusteringPipeline:
 
         print("\n🔧 Step 2: Preparing features...")
         self.features, self.feature_columns = prepare_clustering_features(self.data)
+
+        # Optional column pruning based on correlation
+        if params.ENABLE_COLUMN_PRUNING:
+            numeric_df = self.features.select_dtypes(include=[np.number])
+            if numeric_df.shape[1] > 2:
+                corr = numeric_df.corr().abs()
+                to_drop = set()
+                essentials = {"total_transactions", "total_spend", "avg_unit_purchase_price"}  # Always keep
+                # Upper triangle iteration
+                for i, col1 in enumerate(corr.columns):
+                    if col1 in to_drop:
+                        continue
+                    for j, col2 in enumerate(corr.columns[i+1:], start=i+1):
+                        if col2 in to_drop:
+                            continue
+                        if corr.iloc[i, j] >= params.COLUMN_PRUNE_CORRELATION_THRESHOLD:
+                            # Decide which column to drop: prefer keeping essentials and a canonical metric
+                            if col2 in essentials and col1 not in essentials:
+                                to_drop.add(col1)
+                            elif col1 in essentials:
+                                to_drop.add(col2)
+                            else:
+                                # Prefer dropping duplicate counters like purchase_count over total_transactions
+                                if col2 == "purchase_count":
+                                    to_drop.add(col2)
+                                elif col1 == "purchase_count":
+                                    to_drop.add(col1)
+                                else:
+                                    to_drop.add(col2)
+                if to_drop:
+                    print(f"⚖️  Column pruning: dropping highly correlated columns (>={params.COLUMN_PRUNE_CORRELATION_THRESHOLD}): {', '.join(sorted(to_drop))}")
+                    self.features.drop(columns=list(to_drop), inplace=True, errors='ignore')
+                    self.feature_columns = [c for c in self.feature_columns if c not in to_drop]
+
         self.X_scaled, self.scaler = scale_features(self.features, self.feature_columns)
+        # Impute missing numeric values before PCA/clustering (NaNs can arise from division by zero or single-transaction stddev)
+        numeric_cols = self.features.select_dtypes(include=[np.number]).columns.tolist()
+        if numeric_cols:
+            nan_counts = self.features[numeric_cols].isna().sum()
+            total_nans = int(nan_counts.sum())
+            if total_nans > 0:
+                # Specific zero-imputation candidates
+                zero_fill = [c for c in ['std_purchase_amount_eur','avg_unit_price','purchase_quantity','purchase_amount_eur'] if c in numeric_cols]
+                for c in zero_fill:
+                    self.features[c] = self.features[c].fillna(0)
+                # Median fill for remaining numeric columns with NaNs
+                remaining = [c for c in numeric_cols if self.features[c].isna().any()]
+                for c in remaining:
+                    med = self.features[c].median()
+                    self.features[c] = self.features[c].fillna(med)
+                print(f"🛠️ Imputed {total_nans} missing numeric values (zero-fill: {', '.join(zero_fill)}; median-fill: {', '.join(remaining)})")
+                # Re-scale after imputation to avoid mismatch
+                self.X_scaled, self.scaler = scale_features(self.features, self.feature_columns)
+
+        # Final safeguard: if scaled matrix still contains NaNs, perform direct array-level cleanup
+        if self.X_scaled is not None and np.isnan(self.X_scaled).any():
+            # Identify problematic columns by mapping back to numeric feature names
+            numeric_feature_names = self.features.select_dtypes(include=[np.number]).columns.tolist()
+            nan_mask = np.isnan(self.X_scaled)
+            col_nan_counts = nan_mask.sum(axis=0)
+            problematic = [f"{numeric_feature_names[i]}={col_nan_counts[i]}" for i in range(len(col_nan_counts)) if col_nan_counts[i] > 0 and i < len(numeric_feature_names)]
+            print(f"⚠️ Detected residual NaNs after imputation & scaling: {sum(col_nan_counts)} total across columns: {', '.join(problematic)}")
+            # Replace residual NaNs with 0 (neutral for StandardScaler output) and warn
+            self.X_scaled = np.nan_to_num(self.X_scaled, nan=0.0)
+            print("✅ Replaced remaining NaNs in scaled feature matrix with 0.0 to allow PCA to proceed.")
+
+        # --- Single-column clustering override ---
+        if params.CLUSTER_BY_SINGLE_COLUMN:
+            target_col = params.SINGLE_COLUMN_NAME
+            numeric_feature_names = self.features.select_dtypes(include=[np.number]).columns.tolist()
+            if target_col not in numeric_feature_names:
+                raise ValueError(f"Single-column clustering enabled, but column '{target_col}' not found in numeric features: {numeric_feature_names}")
+            # Find index in numeric feature ordering used during scaling
+            target_index = numeric_feature_names.index(target_col)
+            single_feature_vector = self.X_scaled[:, [target_index]]  # keep 2D shape (n_samples, 1)
+            self.X_for_clustering = single_feature_vector
+            print(f"🎯 Single-column clustering active: using only '{target_col}' ({single_feature_vector.shape[0]} samples). Skipping PCA.")
+        else:
+            self.X_for_clustering = None  # will be set later by PCA or kept as full scaled
+
+        # Optional PCA dimensionality reduction (skip if single-column clustering active)
+        if params.USE_PCA and not params.CLUSTER_BY_SINGLE_COLUMN:
+            pca_initial = PCA(random_state=self.random_state)
+            pca_initial.fit(self.X_scaled)
+            cum_var = np.cumsum(pca_initial.explained_variance_ratio_)
+            n_components = int(np.searchsorted(cum_var, params.PCA_VARIANCE_THRESHOLD) + 1)
+            self.pca_model = PCA(n_components=n_components, random_state=self.random_state)
+            self.X_for_clustering = self.pca_model.fit_transform(self.X_scaled)
+            print(f"🧪 PCA applied: {n_components} components retain {cum_var[n_components-1]:.2%} variance")
+        else:
+            if self.X_for_clustering is None:
+                self.X_for_clustering = self.X_scaled
+
         self._features_prepared = True
 
         print("✅ Features prepared and standardized")
@@ -130,7 +242,10 @@ class ClusteringPipeline:
         print(
             f"   Purchase pattern features: {len([f for f in self.feature_columns if f.startswith('pct_qty_')])}"
         )
-        print(f"   Standardized matrix shape: {self.X_scaled.shape}")
+        if params.USE_PCA:
+            print(f"   PCA-reduced matrix shape: {self.X_for_clustering.shape}")
+        else:
+            print(f"   Standardized matrix shape: {self.X_for_clustering.shape}")
         return self.features, self.feature_columns
 
     def optimize_clusters(self) -> Dict[str, Any]:
@@ -139,8 +254,25 @@ class ClusteringPipeline:
 
         print("\n🔍 Step 3: Optimizing cluster numbers...")
         effective_max_clusters = min(self.max_clusters, max(2, len(self.features) // 10))
+
+        X_optimize = self.X_for_clustering
+        # Optional sampling for optimization only
+        if params.ENABLE_SAMPLING and X_optimize.shape[0] > params.MAX_SAMPLE_SIZE:
+            desired = min(params.MAX_SAMPLE_SIZE, int(X_optimize.shape[0] * params.SAMPLING_FRACTION))
+            rng = np.random.default_rng(self.random_state)
+            self.sampled_indices = rng.choice(X_optimize.shape[0], size=desired, replace=False)
+            X_optimize = X_optimize[self.sampled_indices]
+            print(f"🧪 Sampling enabled: using {desired} rows (fraction={params.SAMPLING_FRACTION}, cap={params.MAX_SAMPLE_SIZE}) for optimization")
+        elif params.ENABLE_SAMPLING and X_optimize.shape[0] <= params.MAX_SAMPLE_SIZE and params.SAMPLING_FRACTION < 1.0:
+            desired = int(X_optimize.shape[0] * params.SAMPLING_FRACTION)
+            if desired >= 10 and desired < X_optimize.shape[0]:
+                rng = np.random.default_rng(self.random_state)
+                self.sampled_indices = rng.choice(X_optimize.shape[0], size=desired, replace=False)
+                X_optimize = X_optimize[self.sampled_indices]
+                print(f"🧪 Sampling enabled: using {desired}/{self.X_for_clustering.shape[0]} rows for optimization")
+
         self.optimization_results = find_optimal_clusters(
-            self.X_scaled,
+            X_optimize,
             max_clusters=effective_max_clusters,
             min_clusters=self.min_clusters,
             random_state=self.random_state,
@@ -177,13 +309,24 @@ class ClusteringPipeline:
 
         method_specific: Dict[str, Any] = {}
         if method == "kmeans":
-            labels, model = perform_kmeans_clustering(self.X_scaled, n_clusters, self.random_state)
+            if params.USE_MINIBATCH_KMEANS:
+                print("⚡ Using MiniBatchKMeans for clustering")
+                model = MiniBatchKMeans(
+                    n_clusters=n_clusters,
+                    random_state=self.random_state,
+                    batch_size=params.MINIBATCH_BATCH_SIZE,
+                    max_iter=params.MINIBATCH_MAX_ITER,
+                    n_init=10,
+                )
+                labels = model.fit_predict(self.X_for_clustering)
+            else:
+                labels, model = perform_kmeans_clustering(self.X_for_clustering, n_clusters, self.random_state)
             method_specific = {"model": model, "n_clusters": n_clusters}
         elif method == "hierarchical":
-            labels, linkage_matrix = perform_hierarchical_clustering(self.X_scaled, n_clusters)
+            labels, linkage_matrix = perform_hierarchical_clustering(self.X_for_clustering, n_clusters)
             method_specific = {"linkage_matrix": linkage_matrix, "n_clusters": n_clusters}
         else:
-            labels, model = perform_dbscan_clustering(self.X_scaled, eps, min_samples)
+            labels, model = perform_dbscan_clustering(self.X_for_clustering, eps, min_samples)
             n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
             n_noise = int((np.asarray(labels) == -1).sum())
             method_specific = {
@@ -195,8 +338,12 @@ class ClusteringPipeline:
                 "min_samples": getattr(model, "min_samples", min_samples),
             }
 
+        # Use original aggregated data for cluster analysis (contains core metrics even if features were pruned)
         df_clustered, summary = analyze_clusters(
-            self.features, labels, self.feature_columns, cluster_method=method.title()
+            self.data if self.data is not None else self.features,
+            labels,
+            self.feature_columns,
+            cluster_method=method.title(),
         )
 
         labels_arr = np.asarray(labels)
@@ -204,14 +351,14 @@ class ClusteringPipeline:
         if method == "dbscan":
             non_noise = labels_arr != -1
             if non_noise.sum() > 1 and len(set(labels_arr[non_noise])) > 1:
-                silhouette_avg = silhouette_score(self.X_scaled[non_noise], labels_arr[non_noise])
+                silhouette_avg = silhouette_score(self.X_for_clustering[non_noise], labels_arr[non_noise])
         else:
             if len(set(labels_arr)) > 1:
-                silhouette_avg = silhouette_score(self.X_scaled, labels_arr)
+                silhouette_avg = silhouette_score(self.X_for_clustering, labels_arr)
 
         calinski_score: Optional[float] = None
         if method != "dbscan" or (-1 not in labels_arr and len(set(labels_arr)) > 1):
-            calinski_score = calinski_harabasz_score(self.X_scaled, labels_arr)
+            calinski_score = calinski_harabasz_score(self.X_for_clustering, labels_arr)
 
         results = {
             "labels": labels_arr,
@@ -294,7 +441,26 @@ class ClusteringPipeline:
             mviz: Dict[str, bool] = {}
             print(f"   📊 Generating {method} visualizations...")
             if show_plots:
-                plot_cluster_visualization(self.X_scaled, res["labels"], self.features, method_name=method.title())
+                # Ensure latest visualization logic (single-feature fallback) is used
+                try:
+                    plot_cluster_visualization(self.X_for_clustering, res["labels"], self.features, method_name=method.title())
+                except ValueError as e:
+                    # Provide graceful degradation if unexpected PCA errors occur
+                    print(f"   ⚠️ Visualization primary path failed: {e}. Attempting fallback 1D plotting.")
+                    import matplotlib.pyplot as plt
+                    import pandas as pd
+                    import numpy as np
+                    X_local = self.X_for_clustering
+                    if X_local is not None and X_local.shape[1] == 1:
+                        fig, ax = plt.subplots(figsize=(10,4))
+                        ax.scatter(X_local[:,0], np.zeros_like(X_local[:,0]), c=res['labels'], cmap='viridis', alpha=0.7)
+                        ax.set_title(f"{method.title()} Clusters (Single Feature Fallback)")
+                        ax.set_xlabel("Standardized Value")
+                        ax.set_yticks([])
+                        plt.tight_layout(); plt.show()
+                        mviz["cluster_visualization_fallback"] = True
+                    else:
+                        print("   ❌ Fallback could not be applied (unexpected shape).")
             mviz["cluster_visualization"] = True
             if show_plots:
                 plot_purchase_patterns_by_cluster(res["df_clustered"], cluster_method=method)
@@ -306,7 +472,7 @@ class ClusteringPipeline:
                 plot_dendrogram(res["linkage_matrix"], self.features)
                 mviz["dendrogram"] = True
             if method == "dbscan" and show_plots:
-                plot_dbscan_analysis(self.X_scaled, res["labels"], self.features, res.get("eps"), res.get("min_samples"))
+                plot_dbscan_analysis(self.X_for_clustering, res["labels"], self.features, res.get("eps"), res.get("min_samples"))
                 mviz["dbscan_analysis"] = True
             visualizations[method] = mviz
         self.analysis_results["visualizations"] = visualizations
@@ -400,3 +566,67 @@ class ClusteringPipeline:
             key_word_description=self.product_description,
         )
         print(f"✅ {method} clustering results saved to BigQuery successfully.")
+        
+    def run_abc_segmentation(
+        self,
+        spend_col: str = 'total_spend',
+        thresholds: tuple = (0.80, 0.95),
+        include_models: bool = True,
+        kmeans_k: int = 3,
+        gmm_max_components: int = 3,
+    ) -> dict:
+        """Compute ABC tiers and optional model-driven tiers (k-means / GMM) on a per-product spend column.
+
+        Args:
+            spend_col: Column name representing per-product spend.
+            thresholds: (A_cut, B_cut) cumulative share thresholds delimiting A/B/C.
+            include_models: If True also compute k-means and GMM tiers for comparison.
+            kmeans_k: Number of clusters for k-means (if enabled).
+            gmm_max_components: Max components for GMM BIC-based selection.
+        Returns:
+            Dict with DataFrames and summaries keyed by segmentation type.
+        """
+        if self.data is None or not self._data_loaded:
+            raise ValueError("Data not loaded. Call load_data() first.")
+        base_df = self.data.copy()
+
+        # Attempt derivation of spend_col if missing and requesting default 'total_spend'
+        if spend_col not in base_df.columns:
+            if spend_col == 'total_spend' and {'purchase_amount_eur','ProductNumber'} <= set(base_df.columns):
+                print("ℹ️ Deriving 'total_spend' from purchase_amount_eur per ProductNumber (sum).")
+                derived = base_df.groupby('ProductNumber')['purchase_amount_eur'].sum().rename('total_spend')
+                base_df = base_df.merge(derived, on='ProductNumber', how='left')
+            else:
+                raise KeyError(f"Spend column '{spend_col}' not found and cannot be derived.")
+
+        print("\n🔁 Running ABC / Pareto spend tier segmentation...")
+        abc_df = compute_abc_tiers(base_df, spend_col=spend_col, thresholds=thresholds)
+        abc_summary = summarize_tiers(abc_df, spend_col=spend_col, tier_col='abc_tier')
+        result: Dict[str, Any] = {
+            'abc_df': abc_df,
+            'abc_summary': abc_summary,
+            'thresholds': thresholds,
+            'spend_col': spend_col,
+        }
+        if include_models:
+            try:
+                km_df = compute_kmeans_tiers(base_df, spend_col=spend_col, k=kmeans_k)
+                km_summary = summarize_tiers(km_df, spend_col=spend_col, tier_col='kmeans_tier')
+                result['kmeans_df'] = km_df
+                result['kmeans_summary'] = km_summary
+            except Exception as e:
+                print(f"⚠️ K-means tiering skipped: {e}")
+            try:
+                gmm_df = compute_gmm_tiers(base_df, spend_col=spend_col, max_components=gmm_max_components)
+                gmm_summary = summarize_tiers(gmm_df, spend_col=spend_col, tier_col='gmm_tier')
+                result['gmm_df'] = gmm_df
+                result['gmm_summary'] = gmm_summary
+            except Exception as e:
+                print(f"⚠️ GMM tiering skipped: {e}")
+        self.analysis_results['abc_segmentation'] = result
+        print("✅ ABC segmentation completed.")
+        print("   Spend column:", spend_col)
+        print("   Thresholds (A,B):", thresholds)
+        print("   Tier distribution (ABC):")
+        print(abc_summary[['abc_tier','count','spend','share_pct']])
+        return result

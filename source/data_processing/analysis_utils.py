@@ -78,7 +78,7 @@ def preprocess_detailed_data(df):
     print(f"Removed {original_len - cleaned_len} rows based on PLMStatusGlobal filter.")
     return df
 
-def create_dashboard_distributions(df, columns_to_plot, outlier_columns=['q95_quantity', 'total_orders']):
+def create_dashboard_distributions(df, columns_to_plot, outlier_columns=['q95_quantity', 'total_purchase_amount_eur']):
     """
     Create a dashboard to visualize distributions of Group Vendors in the DataFrame.
     
@@ -112,7 +112,7 @@ def create_dashboard_distributions(df, columns_to_plot, outlier_columns=['q95_qu
     plt.tight_layout()
     plt.show()
 
-def create_class3_countryoforigin_relationship_dashboard(df, columns_to_plot, outlier_columns=['q95_quantity', 'total_orders']):
+def create_class3_countryoforigin_relationship_dashboard(df, columns_to_plot, outlier_columns=['q95_quantity', 'total_purchase_amount_eur']):
     """
     Create a dashboard showing the relationship Class3 and Country of Origin using boxplots.
     
@@ -215,3 +215,38 @@ def analyze_spend_by_productnumber(df):
     # Basic statistics
     print("Basic statistics of Total Spend by Product Number:")
     print(spend_by_product['TotalSpend'].describe())
+
+def abc_segmentation_analysis(df):
+    """
+    Perform ABC segmentation analysis on the DataFrame.
+    
+    Args:
+        df (pd.DataFrame): Data to analyze
+    """
+    print("📊 Performing ABC segmentation analysis...")
+    
+    spend_by_product = df.groupby('ProductNumber')['TotalSpend'].sum().reset_index()
+    spend_by_product = spend_by_product.sort_values(by='TotalSpend', ascending=False)
+    total_spend = spend_by_product['TotalSpend'].sum()
+    spend_by_product['CumulativeSpend'] = spend_by_product['TotalSpend'].cumsum()
+    spend_by_product['CumulativeShare'] = spend_by_product['CumulativeSpend'] / total_spend
+    
+    # Define ABC tiers
+    def assign_abc_tier(cum_share):
+        if cum_share <= 0.8:
+            return 'A'
+        elif cum_share <= 0.95:
+            return 'B'
+        else:
+            return 'C'
+    
+    spend_by_product['ABC_Tier'] = spend_by_product['CumulativeShare'].apply(assign_abc_tier)
+    
+    # Plot ABC segmentation
+    plt.figure(figsize=(10, 6))
+    sns.countplot(x='ABC_Tier', data=spend_by_product, order=['A', 'B', 'C'], palette='Set2')
+    plt.title('ABC Segmentation of Products')
+    plt.xlabel('ABC Tier')
+    plt.ylabel('Number of Products')
+    plt.tight_layout()
+    plt.show()
