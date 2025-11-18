@@ -5,19 +5,36 @@ This module contains utility functions for processing field names in the table, 
 
 import pandas as pd
 import re
-from nltk.tokenize import word_tokenize
-from nltk.corpus import stopwords
-import nltk
 from difflib import SequenceMatcher
 from collections import defaultdict
 
-# Download NLTK data if not already present
+# ------------------------------------------------------------------
+# Optional NLTK import with graceful fallback
+# ------------------------------------------------------------------
 try:
-    nltk.data.find('tokenizers/punkt')
-    nltk.data.find('corpora/stopwords')
-except LookupError:
-    nltk.download('punkt')
-    nltk.download('stopwords')
+    from nltk.tokenize import word_tokenize  # type: ignore
+    from nltk.corpus import stopwords  # type: ignore
+    import nltk  # type: ignore
+    _NLTK_AVAILABLE = True
+    try:
+        nltk.data.find('tokenizers/punkt')
+        nltk.data.find('corpora/stopwords')
+    except LookupError:
+        # Attempt silent downloads only if environment permits
+        try:
+            nltk.download('punkt', quiet=True)
+            nltk.download('stopwords', quiet=True)
+        except Exception:
+            pass
+except ImportError:
+    _NLTK_AVAILABLE = False
+    # Fallback lightweight tokenizer & stopwords
+    def word_tokenize(text):  # minimal regex-based tokenizer
+        return re.findall(r"[A-Za-z]+", text)
+    class _StopwordsWrapper:
+        def words(self, lang):
+            return set()
+    stopwords = _StopwordsWrapper()
 
 def preprocess_field_name(text):
     """
@@ -37,15 +54,28 @@ def preprocess_field_name(text):
     # Replace underscores with spaces
     text = text.replace('_', ' ')
 
-    # Tokenize and remove stopwords
+    # Tokenize and remove stopwords (fallback if NLTK unavailable)
     tokens = word_tokenize(text)
-    stop_words = set(stopwords.words('english'))
+    try:
+        stop_words = set(stopwords.words('english')) if _NLTK_AVAILABLE else set()
+    except Exception:
+        stop_words = set()
     filtered_tokens = [word for word in tokens if word.lower() not in stop_words]
 
     # Capitalize each word
     processed_text = ' '.join(word.capitalize() for word in filtered_tokens)
 
     return processed_text
+
+def preprocess_field_names(columns):
+    """Vectorized wrapper to preprocess a list/iterable of column names.
+
+    Args:
+        columns (Iterable[str]): Original column names.
+    Returns:
+        list[str]: Preprocessed names.
+    """
+    return [preprocess_field_name(c) for c in columns]
 
 def harmonize_field_names(df, threshold=0.8):
     """
@@ -76,11 +106,12 @@ def harmonize_field_names(df, threshold=0.8):
 
     return df
 def prepare_field_names(df):
-    """Prepare and harmonize field names in the dataframe."""
-    # Preprocess field names
+    """Prepare and harmonize field names in the dataframe.
+
+    Falls back to regex tokenization if NLTK is not installed.
+    """
     df.columns = [preprocess_field_name(col) for col in df.columns]
-    
-    # Harmonize field names
     df = harmonize_field_names(df)
-    
+    if not _NLTK_AVAILABLE:
+        print("⚠️ NLTK not installed; used simple regex tokenization for field name prep.")
     return df

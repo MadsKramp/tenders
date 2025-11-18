@@ -79,7 +79,7 @@ JOIN (
     SELECT
         ProductNumber,
         PLMStatusGlobal,
-        REGEXP_EXTRACT(class2, r'^\s*(\d+)') AS class2_code
+        REGEXP_EXTRACT(class2, r'^\\s*(\\d+)') AS class2_code
     FROM `kramp-purchase-prd.kramp_purchase_customquery.CUQ__TBL__DataDive__Purchase`
 ) AS p
     ON CAST(p.ProductNumber AS STRING) = CAST(b.kramp_item_number AS STRING)
@@ -89,6 +89,19 @@ WHERE p.class2_code = '54'
         '700 - Phased out phase in progress',
         '750 - Phased out phase completed'
     );
+
+-- Purchase stop indicator per product
+CREATE TEMP TABLE products_purchasestop AS
+SELECT
+    b.ProductNumber,
+    CASE WHEN MAX(a.PurchaseStopInd) = MIN(a.PurchaseStopInd) THEN MAX(a.PurchaseStopInd) ELSE MIN(a.PurchaseStopInd) END AS PurchaseStopInd
+FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__REL__companyProduct__current` a
+LEFT JOIN `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__DIM__product__current` b
+    ON a.ProductId = b.ProductId
+LEFT JOIN `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__DIM__company__current` c
+    ON a.CompanyId = c.CompanyId
+WHERE c.CompanyShortDescription LIKE 'Kramp %'
+GROUP BY b.ProductNumber;
 
 CREATE TABLE `kramp-sharedmasterdata-prd.MadsH.purchase_data` AS
 SELECT
@@ -140,10 +153,14 @@ SELECT
     pd.EAN_code,
     pd.cn_code,
     pd.contract_type,
-    bt.key_brand_identifier
+    bt.key_brand_identifier,
+    ps.PurchaseStopInd
 FROM purchase_data AS pd
 LEFT JOIN brand_table AS bt
-    ON CAST(pd.ProductNumber AS STRING) = CAST(bt.ProductNumber AS STRING);
+    ON CAST(pd.ProductNumber AS STRING) = CAST(bt.ProductNumber AS STRING)
+LEFT JOIN products_purchasestop AS ps
+    ON CAST(pd.ProductNumber AS STRING) = CAST(ps.ProductNumber AS STRING)
+WHERE ps.PurchaseStopInd = 'N';
 """
 
 CREATE_ORDER_DATA_SQL = """-- ORDER DATA TABLE BUILD (order_data)
@@ -239,36 +256,46 @@ JOIN items_in_scope AS scope ON scope.ItemNumber = s.ProductNumber
 LEFT JOIN products_purchasestop AS ps ON scope.ItemNumber = ps.ProductNumber;
 """
 
-CREATE_PRODUCT_DATA_SQL = """CREATE SCHEMA IF NOT EXISTS `kramp-sharedmasterdata-prd.MadsH`;
-CREATE TEMP TABLE rel AS SELECT * FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_customquery.CMQ__product_wholesale`;
-CREATE TEMP TABLE v AS SELECT * FROM `kramp-sharedmasterdata-prd.dbt_cloud_pr_258697_428_1739806806.SRC__STEP__Value__latest`;
-CREATE TEMP TABLE gv AS SELECT * FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source.SRC__STEP__Attribute__latest`;
-CREATE TEMP TABLE cal AS SELECT * FROM `kramp-sharedmasterdata-prd.dbt_cloud_pr_258697_428_1739806806.SRC__STEP__Brick_Attribute_Template__latest`;
-CREATE TEMP TABLE cal AS SELECT * FROM `kramp-sharedmasterdata-prd.dbt_cloud_pr_258697_428_1739806806.SRC__STEP__Technical_Item_Classification_Hierarchy__latest`;
+# Minimal placeholder product data script (previous extended dynamic script removed).
+CREATE_PRODUCT_DATA_SQL = """-- PRODUCT DATA TABLE BUILD (placeholder)
+CREATE SCHEMA IF NOT EXISTS `kramp-sharedmasterdata-prd.MadsH`;
 DROP TABLE IF EXISTS `kramp-sharedmasterdata-prd.MadsH.product_data`;
-WITH prod_bricks AS (
-    SELECT p.*, h.BrickID FROM t1 AS p LEFT JOIN t5 AS h ON p.product_id = h.GoldenItemID
-), value_expected AS (
-    SELECT pb.product_id, pb.BrickID, v.ID AS step_id, v.AttributeID, v.Value AS AttributeValue
-    FROM prod_bricks AS pb
-    LEFT JOIN t2 AS v ON v.ID = pb.product_id AND SUBSTR(v.ID, 1, 13) = 'ticGoldenItem'
-    LEFT JOIN t4 AS bat ON bat.BrickID = pb.BrickID AND bat.AttributeID = v.AttributeID
-    WHERE pb.product_id IS NOT NULL
-), value_with_meta AS (
-    SELECT ve.product_id, ve.BrickID, ve.AttributeID, a.Name_ENG AS AttributeName, a.AttributeType AS AttributeType, ve.AttributeValue
-    FROM value_expected AS ve
-    LEFT JOIN t3 AS a ON ve.AttributeID = a.ID
-    WHERE ve.AttributeID IS NOT NULL
-)
-SELECT product_id, BrickID, AttributeID, AttributeName, AttributeType, AttributeValue
-FROM value_with_meta
-ORDER BY product_id, AttributeName;
-"""
+CREATE TABLE `kramp-sharedmasterdata-prd.MadsH.product_data` AS
+SELECT 1 AS dummy;"""
 
 QUERIES = {
         "create_purchase_data": CREATE_PURCHASE_DATA_SQL,
         "create_order_data": CREATE_ORDER_DATA_SQL,
-        "create_product_data": CREATE_PRODUCT_DATA_SQL,
+    "create_product_data": CREATE_PRODUCT_DATA_SQL,
+        "fetch_purchase_data": """-- Fetch aggregated purchase metrics on product level (includes PurchaseStopInd)
+SELECT
+    ProductNumber,
+    ProductDescription,
+    crm_main_vendor,
+    crm_main_group_vendor,
+    class2,
+    class3,
+    class4,
+    brandName,
+    BrandType,
+    countryOfOrigin,
+    PurchaseStopInd,
+    SUM(purchase_amount_eur) AS purchase_amount_eur,
+    SUM(purchase_quantity) AS purchase_quantity
+FROM `{purchase_data_table}`
+GROUP BY
+    ProductNumber,
+    ProductDescription,
+    crm_main_vendor,
+    crm_main_group_vendor,
+    class2,
+    class3,
+    class4,
+    brandName,
+    BrandType,
+    countryOfOrigin,
+    PurchaseStopInd
+ORDER BY purchase_amount_eur DESC""",
 }
 
 def get_query(name: str) -> str:

@@ -87,6 +87,22 @@ WHERE p.class2_code = '54'
   )
 ;
 
+-- Purchase stop status per product (active vs stopped)
+CREATE TEMP TABLE products_purchasestop AS
+SELECT
+  b.ProductNumber,
+  CASE
+    WHEN MAX(a.PurchaseStopInd) = MIN(a.PurchaseStopInd) THEN MAX(a.PurchaseStopInd)
+    ELSE MIN(a.PurchaseStopInd)
+  END AS PurchaseStopInd
+FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__REL__companyProduct__current` a
+LEFT JOIN `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__DIM__product__current` b
+  ON a.ProductId = b.ProductId
+LEFT JOIN `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__DIM__company__current` c
+  ON a.CompanyId = c.CompanyId
+WHERE c.CompanyShortDescription LIKE 'Kramp %'
+GROUP BY b.ProductNumber;
+
 -- Final table: only class2=54 rows plus brand identifier
 CREATE TABLE `kramp-sharedmasterdata-prd.MadsH.purchase_data` AS
 SELECT
@@ -99,7 +115,7 @@ SELECT
   pd.purchase_quantity,
   pd.crm_main_vendor,
   pd.crm_main_group_vendor,
-  pd.class2,                      -- still the full label '54 | Fasteners' if you need it
+  pd.class2,
   pd.class3,
   pd.class4,
   pd.brandName,
@@ -138,7 +154,11 @@ SELECT
   pd.EAN_code,
   pd.cn_code,
   pd.contract_type,
-  bt.key_brand_identifier
+  bt.key_brand_identifier,
+  ps.PurchaseStopInd
 FROM purchase_data AS pd
 LEFT JOIN brand_table AS bt
-  ON CAST(pd.ProductNumber AS STRING) = CAST(bt.ProductNumber AS STRING);
+  ON CAST(pd.ProductNumber AS STRING) = CAST(bt.ProductNumber AS STRING)
+LEFT JOIN products_purchasestop AS ps
+  ON CAST(pd.ProductNumber AS STRING) = CAST(ps.ProductNumber AS STRING)
+WHERE ps.PurchaseStopInd = 'N';

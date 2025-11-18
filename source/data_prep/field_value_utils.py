@@ -93,3 +93,25 @@ def is_valid_units_format(formatted_str):
     import re
     pattern = r'^\d{1,3}(,\d{3})*(\.\d{2})? units$'
     return bool(re.match(pattern, formatted_str))
+
+# ------------------------------------------------------------------
+# Placeholder value preparation pipeline functions (to match notebook imports)
+# ------------------------------------------------------------------
+def preprocess_field_values(df):
+    """Placeholder preprocessing for field values.
+
+    Currently returns DataFrame unchanged; extend with cleaning logic if needed.
+    """
+    return df
+
+def harmonize_field_values(df):
+    """Placeholder harmonization for field values.
+
+    Returns DataFrame unchanged; hook for future normalization rules.
+    """
+    return df
+
+def prepare_field_values(df):
+    """Combined placeholder: preprocess + harmonize field values.
+    """
+    return harmonize_field_values(preprocess_field_values(df))

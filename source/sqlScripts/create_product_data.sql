@@ -1,13 +1,77 @@
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 0) Declarations MUST be at the very start of the script
+-- ─────────────────────────────────────────────────────────────────────────────
+DECLARE cal_has_brickid BOOL DEFAULT (
+  SELECT COUNT(1) > 0
+  FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source`.INFORMATION_SCHEMA.COLUMNS
+  WHERE table_name = 'SRC__STEP__Brick_Attribute_Template__latest'
+    AND column_name = 'BrickID'
+);
+
+DECLARE cal_has_classnode BOOL DEFAULT (
+  SELECT COUNT(1) > 0
+  FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source`.INFORMATION_SCHEMA.COLUMNS
+  WHERE table_name = 'SRC__STEP__Brick_Attribute_Template__latest'
+    AND column_name = 'ClassificationNodeID'
+);
+
+DECLARE tec_has_brickid BOOL DEFAULT (
+  SELECT COUNT(1) > 0
+  FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source`.INFORMATION_SCHEMA.COLUMNS
+  WHERE table_name = 'SRC__STEP__Technical_Item_Classification_Hierarchy__latest'
+    AND column_name = 'BrickID'
+);
+
+DECLARE tec_has_classnode BOOL DEFAULT (
+  SELECT COUNT(1) > 0
+  FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source`.INFORMATION_SCHEMA.COLUMNS
+  WHERE table_name = 'SRC__STEP__Technical_Item_Classification_Hierarchy__latest'
+    AND column_name = 'ClassificationNodeID'
+);
+
+DECLARE gv_has_attrtype BOOL DEFAULT (
+  SELECT COUNT(1) > 0
+  FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source`.INFORMATION_SCHEMA.COLUMNS
+  WHERE table_name = 'SRC__STEP__Attribute__latest'
+    AND column_name = 'AttributeType'
+);
+
+DECLARE join_on STRING;
+DECLARE select_h_brickid STRING;
+DECLARE select_h_classnode STRING;
+DECLARE select_attrtype_expr STRING;
+DECLARE sql STRING;
+
+-- Build the safe join condition based on what exists
+SET join_on = IF(cal_has_brickid AND tec_has_brickid,
+                 'bat.BrickID = pb.BrickID',
+                 IF(cal_has_classnode AND tec_has_classnode,
+                    'bat.ClassificationNodeID = pb.ClassificationNodeID',
+                    '1 = 0'  -- safe fallback to avoid a bad cartesian join
+                 ));
+
+-- Only reference columns that actually exist; otherwise provide a NULL alias
+SET select_h_brickid   = IF(tec_has_brickid,   ', h.BrickID',              ', NULL AS BrickID');
+SET select_h_classnode = IF(tec_has_classnode, ', h.ClassificationNodeID', ', NULL AS ClassificationNodeID');
+SET select_attrtype_expr = IF(gv_has_attrtype,
+                              'a.AttributeType AS AttributeType',
+                              'NULL AS AttributeType');
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 1) Create the target schema if needed
+-- ─────────────────────────────────────────────────────────────────────────────
 CREATE SCHEMA IF NOT EXISTS `kramp-sharedmasterdata-prd.MadsH`;
 
--- 1) Stage sources as temp tables (keeps the final SELECT simple)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 2) Stage sources as temp tables (keeps the final SELECT simple)
+-- ─────────────────────────────────────────────────────────────────────────────
 CREATE TEMP TABLE rel AS
 SELECT *
 FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_customquery.CMQ__product_wholesale`;
 
 CREATE TEMP TABLE v AS
 SELECT *
-FROM `kramp-sharedmasterdata-prd.dbt_cloud_pr_258697_428_1739806806.SRC__STEP__Value__latest`;
+FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source.SRC__STEP__Value__latest`;
 
 CREATE TEMP TABLE gv AS
 SELECT *
@@ -15,78 +79,94 @@ FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source.SRC__STEP__Attrib
 
 CREATE TEMP TABLE cal AS
 SELECT *
-FROM `kramp-sharedmasterdata-prd.dbt_cloud_pr_258697_428_1739806806.SRC__STEP__Brick_Attribute_Template__latest`;
+FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source.SRC__STEP__Brick_Attribute_Template__latest`;
 
-CREATE TEMP TABLE cal AS
+CREATE TEMP TABLE tec AS
 SELECT *
-FROM `kramp-sharedmasterdata-prd.dbt_cloud_pr_258697_428_1739806806.SRC__STEP__Technical_Item_Classification_Hierarchy__latest`;
+FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source.SRC__STEP__Technical_Item_Classification_Hierarchy__latest`;
 
--- 2) Build final table
-DROP TABLE IF EXISTS `kramp-sharedmasterdata-prd.MadsH.product_data`;
-
-CREATE TABLE `kramp-sharedmasterdata-prd.MadsH.product_data` AS
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 3) Build final table with dynamic SQL that references only existing columns
+--    and pivots attributes to columns (plus ProductNumber)
+-- ─────────────────────────────────────────────────────────────────────────────
+SET sql = '''
+CREATE OR REPLACE TABLE `kramp-sharedmasterdata-prd.MadsH.product_data` AS
 WITH
--- Map wholesale product → Brick via hierarchy
 prod_bricks AS (
   SELECT
-    p.*,                         -- all wholesale product fields (adjust if too wide)
-    h.BrickID                    -- the Brick that (should) govern attributes
-  FROM t1 AS p
-  LEFT JOIN t5 AS h
+    p.*''' || select_h_brickid || select_h_classnode || '''
+  FROM rel AS p
+  LEFT JOIN tec AS h
     ON p.product_id = h.GoldenItemID
 ),
-
--- Limit STEP Values to Golden Items and join only attributes
--- that are expected for the product's Brick
 value_expected AS (
   SELECT
     pb.product_id,
     pb.BrickID,
-    v.ID            AS step_id,          -- Golden Item ID in STEP (ticGoldenItem…)
+    pb.ClassificationNodeID,
+    v.ID            AS step_id,
     v.AttributeID,
     v.Value         AS AttributeValue
   FROM prod_bricks AS pb
-  -- Only Golden Item values to avoid non-product IDs
-  LEFT JOIN t2 AS v
+  LEFT JOIN v
     ON v.ID = pb.product_id
-   AND SUBSTR(v.ID, 1, 13) = 'ticGoldenItem'
-  -- Keep only attributes that are part of the product's Brick template
-  LEFT JOIN t4 AS bat
-    ON bat.BrickID = pb.BrickID
+   AND STARTS_WITH(v.ID, "ticGoldenItem")
+  LEFT JOIN cal AS bat
+    ON ''' || join_on || '''
    AND bat.AttributeID = v.AttributeID
   WHERE pb.product_id IS NOT NULL
 ),
-
--- Attach attribute metadata (description, type, etc.)
 value_with_meta AS (
   SELECT
     ve.product_id,
     ve.BrickID,
     ve.AttributeID,
-    a.Name_ENG            AS AttributeName,        -- adjust if your field differs
-    a.AttributeType       AS AttributeType,        -- optional, if present
+    a.Name_ENG      AS AttributeName,
+    ''' || select_attrtype_expr || ''',
     ve.AttributeValue
   FROM value_expected AS ve
-  LEFT JOIN t3 AS a
+  LEFT JOIN gv AS a
     ON ve.AttributeID = a.ID
-  -- Keep only rows where the attribute is defined for the Brick.
-  -- If you want to *see* missing values for expected attributes, swap the logic:
-  --   join t4 → left join v; but that needs a list of all expected attributes per Brick.
   WHERE ve.AttributeID IS NOT NULL
 )
 
+-- Final wide table: one row per product_id (and BrickID), with ProductNumber and requested attributes
 SELECT
-  -- Keys
   product_id,
   BrickID,
 
-  -- Attribute metadata
-  AttributeID,
-  AttributeName,
-  AttributeType,
+  -- Product number from attItemNumber
+  MAX(IF(AttributeID = 'attItemNumber', AttributeValue, NULL)) AS ProductNumber,
 
-  -- Actual value (text as-is from STEP Value)
-  AttributeValue
+  -- Requested attributes (match Name_ENG first; fall back to plausible AttributeIDs)
+  MAX(IF(LOWER(AttributeName) = 'unit'                                      OR AttributeID = 'attUnit',                AttributeValue, NULL)) AS unit,
+  MAX(IF(LOWER(AttributeName) = 'head shape'                                OR AttributeID = 'attHeadShape',           AttributeValue, NULL)) AS head_shape,
+  MAX(IF(LOWER(AttributeName) = 'thread type'                               OR AttributeID = 'attThreadType',          AttributeValue, NULL)) AS thread_type,
+  MAX(IF(LOWER(AttributeName) = 'head height'                               OR AttributeID = 'attHeadHeight',          AttributeValue, NULL)) AS head_height,
+  MAX(IF(LOWER(AttributeName) = 'head outside diameter (width)'             OR AttributeID = 'attHeadOutsideDiameter', AttributeValue, NULL)) AS head_outside_diameter_width,
+  MAX(IF(LOWER(AttributeName) = 'quality'                                   OR AttributeID = 'attQuality',             AttributeValue, NULL)) AS quality,
+  MAX(IF(LOWER(AttributeName) = 'surface treatment'                         OR AttributeID = 'attSurfaceTreatment',    AttributeValue, NULL)) AS surface_treatment,
+  MAX(IF(LOWER(AttributeName) = 'material'                                  OR AttributeID = 'attMaterial',            AttributeValue, NULL)) AS material,
+  MAX(IF(LOWER(AttributeName) = 'din standard'                              OR AttributeID = 'attDINStandard',         AttributeValue, NULL)) AS din_standard,
+  MAX(IF(LOWER(AttributeName) = 'weight per 100 pcs'                        OR AttributeID = 'attWeightPer100Pcs',     AttributeValue, NULL)) AS weight_per_100_pcs,
+  MAX(IF(LOWER(AttributeName) = 'content in sales unit'                     OR AttributeID = 'attContentInSalesUnit',  AttributeValue, NULL)) AS content_in_sales_unit,
+  MAX(IF(LOWER(AttributeName) = 'thread diameter'                           OR AttributeID = 'attThreadDiameter',      AttributeValue, NULL)) AS thread_diameter,
+  MAX(IF(LOWER(AttributeName) = 'length'                                    OR AttributeID = 'attLength',              AttributeValue, NULL)) AS length,
+  MAX(IF(LOWER(AttributeName) = 'height'                                    OR AttributeID = 'attHeight',              AttributeValue, NULL)) AS height,
+  MAX(IF(LOWER(AttributeName) = 'total height'                              OR AttributeID = 'attTotalHeight',         AttributeValue, NULL)) AS total_height,
+  MAX(IF(LOWER(AttributeName) = 'width'                                     OR AttributeID = 'attWidth',               AttributeValue, NULL)) AS width,
+  MAX(IF(LOWER(AttributeName) = 'iso standard'                              OR AttributeID = 'attISOStandard',         AttributeValue, NULL)) AS iso_standard,
+  MAX(IF(LOWER(AttributeName) = 'inside diameter'                           OR AttributeID = 'attInsideDiameter',      AttributeValue, NULL)) AS inside_diameter,
+  MAX(IF(LOWER(AttributeName) = 'outside diameter'                          OR AttributeID = 'attOutsideDiameter',     AttributeValue, NULL)) AS outside_diameter,
+  MAX(IF(LOWER(AttributeName) = 'thickness'                                 OR AttributeID = 'attThickness',           AttributeValue, NULL)) AS thickness,
+  MAX(IF(LOWER(AttributeName) = 'designed for thread'                       OR AttributeID = 'attDesignedForThread',   AttributeValue, NULL)) AS designed_for_thread,
+  MAX(IF(LOWER(AttributeName) = 'total length'                              OR AttributeID = 'attTotalLength',         AttributeValue, NULL)) AS total_length,
+  MAX(IF(LOWER(AttributeName) = 'head type'                                 OR AttributeID = 'attHeadType',            AttributeValue, NULL)) AS head_type,
+  MAX(IF(LOWER(AttributeName) = 'thread length'                             OR AttributeID = 'attThreadLength',        AttributeValue, NULL)) AS thread_length
 
 FROM value_with_meta
-ORDER BY product_id, AttributeName;
+GROUP BY product_id, BrickID
+ORDER BY product_id
+''';
+
+EXECUTE IMMEDIATE sql;

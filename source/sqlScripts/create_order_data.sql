@@ -103,14 +103,20 @@ DROP TABLE IF EXISTS `kramp-sharedmasterdata-prd.MadsH.order_data`;
 
 CREATE TABLE `kramp-sharedmasterdata-prd.MadsH.order_data` AS
 SELECT
-  s.*,                             -- sales metrics
-  scope.*,                         -- classification & attribute slice
-  ps.PurchaseStopInd
+  s.*,                               -- sales metrics
+  scope.*,                           -- classification & attribute slice
+  ps.PurchaseStopInd,                -- purchase stop indicator
+  purch.year_authorization AS purchase_year_authorization,  -- purchase data enrichment
+  purch.purchase_amount_eur,         -- (raw) purchase amount
+  purch.purchase_quantity            -- (raw) purchase quantity
 FROM items_sold AS s
 JOIN items_in_scope AS scope
   ON scope.ItemNumber = s.ProductNumber
 LEFT JOIN products_purchasestop AS ps
-  ON scope.ItemNumber = ps.ProductNumber;
+  ON scope.ItemNumber = ps.ProductNumber
+LEFT JOIN `kramp-purchase-prd.kramp_purchase_customquery.CUQ__TBL__DataDive__Purchase` AS purch
+  ON scope.ItemNumber = purch.ProductNumber
+WHERE ps.PurchaseStopInd = 'N';  -- retain only active (not purchase-stopped) items
 
 -- Optional sanity checks (uncomment as needed)
 -- SELECT COUNT(*) FROM `kramp-sharedmasterdata-prd.MadsH.order_data`;
