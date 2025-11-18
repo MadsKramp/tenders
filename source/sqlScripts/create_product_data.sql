@@ -42,7 +42,7 @@ DECLARE gv_has_attrtype BOOL DEFAULT (
 CREATE SCHEMA IF NOT EXISTS `kramp-sharedmasterdata-prd.MadsH`;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 2) Stage sources as temp tables (normalize keys to STRING)
+-- 2) Stage sources as temp tables (normalize keys to STRING where safe)
 -- ─────────────────────────────────────────────────────────────────────────────
 -- rel: force product_id to STRING so all downstream joins are string-safe
 CREATE TEMP TABLE rel AS
@@ -58,9 +58,9 @@ SELECT * REPLACE (
 )
 FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source.SRC__STEP__Value__latest`;
 
--- gv: force ID to STRING so it matches v.AttributeID
-CREATE TEMP TABLE gv AS
-SELECT * REPLACE (CAST(ID AS STRING) AS ID)
+-- gv source as-is first
+CREATE TEMP TABLE gv_src AS
+SELECT *
 FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source.SRC__STEP__Attribute__latest`;
 
 -- cal / tec as-is (we'll branch below to avoid touching missing cols)
@@ -75,6 +75,7 @@ FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source.SRC__STEP__Techni
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 2b) prod_bricks with safe columns (never reference missing cols)
 --     product_id is already STRING (from rel). GoldenItemID → STRING.
+--     Use CAST(NULL AS STRING) for absent columns.
 -- ─────────────────────────────────────────────────────────────────────────────
 IF tec_has_brickid AND tec_has_classnode THEN
   CREATE TEMP TABLE prod_bricks AS
@@ -90,7 +91,7 @@ ELSEIF tec_has_brickid AND NOT tec_has_classnode THEN
   SELECT
     p.*,
     CAST(h.BrickID AS STRING) AS BrickID,
-    NULL AS ClassificationNodeID
+    CAST(NULL AS STRING) AS ClassificationNodeID
   FROM rel AS p
   LEFT JOIN tec AS h
     ON p.product_id = CAST(h.GoldenItemID AS STRING);
@@ -98,7 +99,7 @@ ELSEIF NOT tec_has_brickid AND tec_has_classnode THEN
   CREATE TEMP TABLE prod_bricks AS
   SELECT
     p.*,
-    NULL AS BrickID,
+    CAST(NULL AS STRING) AS BrickID,
     CAST(h.ClassificationNodeID AS STRING) AS ClassificationNodeID
   FROM rel AS p
   LEFT JOIN tec AS h
@@ -107,13 +108,14 @@ ELSE
   CREATE TEMP TABLE prod_bricks AS
   SELECT
     p.*,
-    NULL AS BrickID,
-    NULL AS ClassificationNodeID
+    CAST(NULL AS STRING) AS BrickID,
+    CAST(NULL AS STRING) AS ClassificationNodeID
   FROM rel AS p;
 END IF;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 2c) cal_ready with safe STRING keys (so bat.* names always exist)
+--     Use CAST(NULL AS STRING) for absent columns.
 -- ─────────────────────────────────────────────────────────────────────────────
 IF cal_has_brickid AND cal_has_classnode THEN
   CREATE TEMP TABLE cal_ready AS
@@ -125,20 +127,34 @@ ELSEIF cal_has_brickid AND NOT cal_has_classnode THEN
   CREATE TEMP TABLE cal_ready AS
   SELECT CAST(AttributeID AS STRING) AS AttributeID,
          CAST(BrickID AS STRING)     AS BrickID,
-         NULL AS ClassificationNodeID
+         CAST(NULL AS STRING) AS ClassificationNodeID
   FROM cal;
 ELSEIF NOT cal_has_brickid AND cal_has_classnode THEN
   CREATE TEMP TABLE cal_ready AS
   SELECT CAST(AttributeID AS STRING) AS AttributeID,
-         NULL AS BrickID,
+         CAST(NULL AS STRING) AS BrickID,
          CAST(ClassificationNodeID AS STRING) AS ClassificationNodeID
   FROM cal;
 ELSE
   CREATE TEMP TABLE cal_ready AS
   SELECT CAST(AttributeID AS STRING) AS AttributeID,
-         NULL AS BrickID,
-         NULL AS ClassificationNodeID
+         CAST(NULL AS STRING) AS BrickID,
+         CAST(NULL AS STRING) AS ClassificationNodeID
   FROM cal;
+END IF;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 2d) gv_ready with safe STRING keys and ALWAYS an AttributeType column
+--     (nullable when the source lacks it)
+-- ─────────────────────────────────────────────────────────────────────────────
+IF gv_has_attrtype THEN
+  CREATE TEMP TABLE gv_ready AS
+  SELECT CAST(ID AS STRING) AS ID, Name_ENG, CAST(AttributeType AS STRING) AS AttributeType
+  FROM gv_src;
+ELSE
+  CREATE TEMP TABLE gv_ready AS
+  SELECT CAST(ID AS STRING) AS ID, Name_ENG, CAST(NULL AS STRING) AS AttributeType
+  FROM gv_src;
 END IF;
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -149,8 +165,8 @@ WITH
 value_expected AS (
   SELECT
     pb.product_id,             -- STRING
-    pb.BrickID,                -- STRING or NULL
-    pb.ClassificationNodeID,   -- STRING or NULL
+    pb.BrickID,                -- STRING (or NULL STRING)
+    pb.ClassificationNodeID,   -- STRING (or NULL STRING)
     v.ID          AS step_id,           -- STRING
     v.AttributeID AS AttributeID,       -- STRING
     v.Value       AS AttributeValue     -- STRING
@@ -173,11 +189,11 @@ value_with_meta AS (
     ve.BrickID,
     ve.AttributeID,  -- STRING
     a.Name_ENG AS AttributeName,
-    IF(gv_has_attrtype, a.AttributeType, NULL) AS AttributeType,
+    a.AttributeType,
     ve.AttributeValue
   FROM value_expected AS ve
-  LEFT JOIN gv AS a
-    ON ve.AttributeID = a.ID      -- gv.ID was normalized to STRING above
+  LEFT JOIN gv_ready AS a
+    ON ve.AttributeID = a.ID
   WHERE ve.AttributeID IS NOT NULL
 ),
 

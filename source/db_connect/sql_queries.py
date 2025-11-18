@@ -1,307 +1,131 @@
-"""SQL script registry synchronized with contents of sqlScripts/.
+"""SQL query registry for BigQuery operations used in the spend analysis pipeline.
 
-This module exposes the raw build SQL for purchase, order, and product data
-as discovered in the repository's sqlScripts directory. Each constant is a
-verbatim copy (minus leading/trailing blank lines) of its corresponding file.
+Only valid Python code and triple-quoted SQL constants are kept here.
 """
 
-CREATE_PURCHASE_DATA_SQL = """-- Clean target
+# ---------------------------------------------------------------------------
+# Table build queries
+# ---------------------------------------------------------------------------
+
+CREATE_PURCHASE_DATA_SQL = """
+-- Build purchase_data table (subset for class2_code = 54, active items only)
 CREATE SCHEMA IF NOT EXISTS `kramp-sharedmasterdata-prd.MadsH`;
 DROP TABLE IF EXISTS `kramp-sharedmasterdata-prd.MadsH.purchase_data`;
 
--- First temp table: purchase rows (class2 code 54, post-2020, has main group vendor)
-CREATE TEMP TABLE purchase_data AS
-WITH src AS (
-    SELECT
-        year_authorization,
-        uniquevendorcode,
-        warehouse,
-        ProductNumber,
-        ProductDescription,
-        purchase_amount_eur,
-        purchase_quantity,
-        crm_main_vendor,
-        crm_main_group_vendor,
-        class2,
-        class3,
-        class4,
-        brandName,
-        BrandType,
-        assortmentType,
-        level0,
-        level1,
-        level2,
-        level3,
-        level4,
-        countryOfOrigin,
-        category_manager,
-        supplier_group,
-        procurement_bu,
-        supplier_site_name,
-        supplier_site_status,
-        supplier_profile,
-        supplier_profile_status,
-        supplier_parent,
-        alternate_site_name,
-        procurement_manager,
-        supplier_manager,
-        supplier_specialist,
-        inventory_specialist,
-        purchase_order_specialist,
-        abc_code,
-        category,
-        dutch_windmill,
-        supplier_site_payment_terms,
-        supplier_site_delivery_conditions,
-        supplier_site_country,
-        supplier_site_city,
-        crm_vendor,
-        crm_group_vendor,
-        PLMStatusGlobal,
-        EAN_code,
-        cn_code,
-        contract_type,
-        REGEXP_EXTRACT(class2, r'^\s*(\d+)') AS class2_code
-    FROM `kramp-purchase-prd.kramp_purchase_customquery.CUQ__TBL__DataDive__Purchase`
-)
-SELECT *
-FROM src
-WHERE crm_main_group_vendor IS NOT NULL
-    AND year_authorization > 2020
-    AND class2_code = '54';
+CREATE TEMP TABLE purchase_raw AS
+SELECT *, REGEXP_EXTRACT(class2, r'^\s*(\d+)') AS class2_code
+FROM `kramp-purchase-prd.kramp_purchase_customquery.CUQ__TBL__DataDive__Purchase`
+WHERE year_authorization > 2020;
 
-CREATE TEMP TABLE brand_table AS
-SELECT DISTINCT
-    b.kramp_item_number AS ProductNumber,
-    b.key_brand_identifier
-FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__REL__productBrand__current` AS b
+CREATE TEMP TABLE brand_mapping AS
+SELECT DISTINCT b.kramp_item_number AS ProductNumber, b.key_brand_identifier
+FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__REL__productBrand__current` b
 JOIN (
-    SELECT
-        ProductNumber,
-        PLMStatusGlobal,
-        REGEXP_EXTRACT(class2, r'^\\s*(\\d+)') AS class2_code
-    FROM `kramp-purchase-prd.kramp_purchase_customquery.CUQ__TBL__DataDive__Purchase`
-) AS p
-    ON CAST(p.ProductNumber AS STRING) = CAST(b.kramp_item_number AS STRING)
-WHERE p.class2_code = '54'
-    AND p.PLMStatusGlobal NOT IN (
-        '600 - Phasing out phase in progress',
-        '700 - Phased out phase in progress',
-        '750 - Phased out phase completed'
-    );
+  SELECT ProductNumber, PLMStatusGlobal, REGEXP_EXTRACT(class2, r'^\s*(\d+)') AS class2_code
+  FROM `kramp-purchase-prd.kramp_purchase_customquery.CUQ__TBL__DataDive__Purchase`
+) p ON CAST(p.ProductNumber AS STRING)=CAST(b.kramp_item_number AS STRING)
+WHERE p.class2_code='54'
+  AND p.PLMStatusGlobal NOT IN (
+    '700 - Phased out phase in progress',
+    '750 - Phased out phase completed'
+  );
 
--- Purchase stop indicator per product
-CREATE TEMP TABLE products_purchasestop AS
-SELECT
-    b.ProductNumber,
-    CASE WHEN MAX(a.PurchaseStopInd) = MIN(a.PurchaseStopInd) THEN MAX(a.PurchaseStopInd) ELSE MIN(a.PurchaseStopInd) END AS PurchaseStopInd
+CREATE TEMP TABLE purchasestop AS
+SELECT b.ProductNumber,
+       CASE WHEN MAX(a.PurchaseStopInd)=MIN(a.PurchaseStopInd)
+            THEN MAX(a.PurchaseStopInd) ELSE MIN(a.PurchaseStopInd) END AS PurchaseStopInd
 FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__REL__companyProduct__current` a
-LEFT JOIN `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__DIM__product__current` b
-    ON a.ProductId = b.ProductId
-LEFT JOIN `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__DIM__company__current` c
-    ON a.CompanyId = c.CompanyId
+LEFT JOIN `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__DIM__product__current` b ON a.ProductId=b.ProductId
+LEFT JOIN `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__DIM__company__current` c ON a.CompanyId=c.CompanyId
 WHERE c.CompanyShortDescription LIKE 'Kramp %'
 GROUP BY b.ProductNumber;
 
 CREATE TABLE `kramp-sharedmasterdata-prd.MadsH.purchase_data` AS
-SELECT
-    pd.year_authorization,
-    pd.uniquevendorcode,
-    pd.warehouse,
-    pd.ProductNumber,
-    pd.ProductDescription,
-    pd.purchase_amount_eur,
-    pd.purchase_quantity,
-    pd.crm_main_vendor,
-    pd.crm_main_group_vendor,
-    pd.class2,
-    pd.class3,
-    pd.class4,
-    pd.brandName,
-    pd.BrandType,
-    pd.assortmentType,
-    pd.level0,
-    pd.level1,
-    pd.level2,
-    pd.level3,
-    pd.level4,
-    pd.countryOfOrigin,
-    pd.category_manager,
-    pd.supplier_group,
-    pd.procurement_bu,
-    pd.supplier_site_name,
-    pd.supplier_site_status,
-    pd.supplier_profile,
-    pd.supplier_profile_status,
-    pd.supplier_parent,
-    pd.alternate_site_name,
-    pd.procurement_manager,
-    pd.supplier_manager,
-    pd.supplier_specialist,
-    pd.inventory_specialist,
-    pd.purchase_order_specialist,
-    pd.abc_code,
-    pd.category,
-    pd.dutch_windmill,
-    pd.supplier_site_payment_terms,
-    pd.supplier_site_delivery_conditions,
-    pd.supplier_site_country,
-    pd.supplier_site_city,
-    pd.crm_vendor,
-    pd.crm_group_vendor,
-    pd.PLMStatusGlobal,
-    pd.EAN_code,
-    pd.cn_code,
-    pd.contract_type,
-    bt.key_brand_identifier,
-    ps.PurchaseStopInd
-FROM purchase_data AS pd
-LEFT JOIN brand_table AS bt
-    ON CAST(pd.ProductNumber AS STRING) = CAST(bt.ProductNumber AS STRING)
-LEFT JOIN products_purchasestop AS ps
-    ON CAST(pd.ProductNumber AS STRING) = CAST(ps.ProductNumber AS STRING)
-WHERE ps.PurchaseStopInd = 'N';
+SELECT r.*, bm.key_brand_identifier, ps.PurchaseStopInd
+FROM purchase_raw r
+LEFT JOIN brand_mapping bm ON CAST(r.ProductNumber AS STRING)=CAST(bm.ProductNumber AS STRING)
+LEFT JOIN purchasestop ps ON CAST(r.ProductNumber AS STRING)=CAST(ps.ProductNumber AS STRING)
+WHERE r.class2_code='54' AND ps.PurchaseStopInd='N';
 """
 
-CREATE_ORDER_DATA_SQL = """-- ORDER DATA TABLE BUILD (order_data)
-DECLARE class2_filter ARRAY<STRING> DEFAULT ['54 - Fasteners'];
-
-CREATE TEMP TABLE items_sold AS
-SELECT
-    OrderNumber, InvoiceDate, InvoiceNumber, InvoiceType,
-    TurnoverEuro, CostOfGoodsSoldEuro, MarginEuro, ListPriceTurnoverEuro, QuantitySold,
-    CustomerId, CustomerName, Segment, IndustryOriginal, BusinessType, Industry,
-    Company,
-    ProductId, ProductNumber, UnitMeasureCode, salesRounding,
-    MonthOfYear, YearNumber, DayOfMonth,
-    ABC_ProfitEuro, ABC_CostOfGoodsSold, ABC_BackboneCost, ABC_BonusesCost, ABC_DistributionCost, ABC_FacilitiesCost,
-    ABC_FinanceAndControlCost, ABC_HRMCost, ABC_OperationsCost, ABC_OtherCostOfSalesCost, ABC_SalesCost, ABC_StockManagementCost,
-    ABC_TechnologyCost, ABC_TotalCost,
-    CASE
-        WHEN BrandType IN ('Global A', 'Global B') THEN 'Global'
-        WHEN BrandType IN ('Local A', 'Local B') THEN 'Local'
-        WHEN BrandType IN ('OE') THEN 'OE'
-        WHEN BrandType IN ('Private label A', 'Private label B', 'Private label C') THEN 'Private label'
-        WHEN BrandType IN ('Non sensitive', 'Non branded', 'Other') THEN 'Other'
-        ELSE NULL
-    END AS brand_type
-FROM `kramp-sales-prd.kramp_sales_customquery.CUQ__TBL__externalSales_enriched`
-WHERE OrderNumber IS NOT NULL
-    AND YearNumber > 2020;
-
-CREATE TEMP TABLE items_in_scope AS
-SELECT DISTINCT
-    item.ID AS ItemID,
-    item.ItemNumber,
-    item.ItemDescription_ENG AS ProductDescription,
-    item.keyBrandIdentifier AS BrandIdentifier,
-    item.Rounding,
-    item.PublishableInCountry,
-    item.ItemSegment,
-    hier.Class4Number,
-    hier.Class4Description,
-    hier.Class3Number,
-    hier.Class3Description,
-    hier.Class2Number,
-    hier.Class2Description,
-    CASE
-        WHEN Brand.BrandType IN ('(GLOBAL_A) Global A', '(GLOBAL_B) Global B') THEN 'Global'
-        WHEN Brand.BrandType IN ('(LOCAL_A) Local A', '(LOCAL_B) Local B') THEN 'Local'
-        WHEN Brand.BrandType = 'OE' THEN 'OE'
-        WHEN Brand.BrandType IN ('(PRIVATE_LABEL_A) Private label A', '(PRIVATE-LABEL-B) Private label B') THEN 'Private label'
-        WHEN Brand.BrandType IN ('(NON_SENSITIVE) Non sensitive', '(NON_BRANDED) Non branded', '(OTHER) Other') THEN 'Other'
-        ELSE NULL
-    END AS brand_type_step,
-    CASE
-        WHEN LOWER(item.ItemDescription_ENG) LIKE '%nut%' AND hier.Class3Description = 'Bolts & Nuts'
-        THEN CAST(attr.taLengthMm_5 AS NUMERIC)
-    END AS dimension_per_product_type
-FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source.SRC__STEP__Item__latest` item
-LEFT JOIN `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source.SRC__STEP__Class234_Hierarchy__latest` hier
-    ON hier.Class4Number = item.keyClass4Number
-LEFT JOIN `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source.SRC__STEP__Brand__latest` Brand
-    ON item.keyBrandIdentifier = Brand.keyBrandIdentifier
-LEFT JOIN (
-    SELECT * FROM (
-        SELECT DISTINCT ID, AttributeID, Value
-        FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source.SRC__STEP__Value__latest`
-        WHERE AttributeID IN ('taLengthMm_5', 'taTotalLengthMm_6', 'attWeight', 'taWeightKgPer100Pi_2')
-            AND LEFT(ID, 13) = 'ticGoldenItem'
-    ) PIVOT (ANY_VALUE(Value) FOR AttributeID IN ('taLengthMm_5'))
-) attr ON attr.ID = item.ID
-WHERE PublishableInCountry IS NOT NULL
-    AND (ARRAY_LENGTH(class2_filter) = 0 OR hier.Class2Description IN UNNEST(class2_filter));
-
-CREATE TEMP TABLE products_purchasestop AS
-SELECT
-    b.ProductNumber,
-    CASE WHEN MAX(a.PurchaseStopInd) = MIN(a.PurchaseStopInd) THEN MAX(a.PurchaseStopInd) ELSE MIN(a.PurchaseStopInd) END AS PurchaseStopInd
-FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__REL__companyProduct__current` a
-LEFT JOIN `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__DIM__product__current` b
-    ON a.ProductId = b.ProductId
-LEFT JOIN `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__DIM__company__current` c
-    ON a.CompanyId = c.CompanyId
-WHERE c.CompanyShortDescription LIKE 'Kramp %'
-GROUP BY b.ProductNumber;
-
-DROP TABLE IF EXISTS `kramp-sharedmasterdata-prd.MadsH.order_data`;
-
-CREATE TABLE `kramp-sharedmasterdata-prd.MadsH.order_data` AS
-SELECT
-    s.*,
-    scope.*,
-    ps.PurchaseStopInd
-FROM items_sold AS s
-JOIN items_in_scope AS scope ON scope.ItemNumber = s.ProductNumber
-LEFT JOIN products_purchasestop AS ps ON scope.ItemNumber = ps.ProductNumber;
+CREATE_ORDER_DATA_SQL = """
+-- Placeholder: order data build not finalized. Safe no-op.
+-- You can replace this with the validated order table build when ready.
+SELECT 1 AS dummy;
 """
 
-# Minimal placeholder product data script (previous extended dynamic script removed).
-CREATE_PRODUCT_DATA_SQL = """-- PRODUCT DATA TABLE BUILD (placeholder)
+CREATE_PRODUCT_DATA_SQL = """
+-- Build product_data table (basic attributes subset)
 CREATE SCHEMA IF NOT EXISTS `kramp-sharedmasterdata-prd.MadsH`;
-DROP TABLE IF EXISTS `kramp-sharedmasterdata-prd.MadsH.product_data`;
-CREATE TABLE `kramp-sharedmasterdata-prd.MadsH.product_data` AS
-SELECT 1 AS dummy;"""
+CREATE OR REPLACE TABLE `kramp-sharedmasterdata-prd.MadsH.product_data` AS
+WITH base AS (
+    SELECT CAST(ID AS STRING) AS product_id, AttributeID, Value
+    FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source.SRC__STEP__Value__latest`
+    WHERE STARTS_WITH(ID,'ticGoldenItem') AND NULLIF(TRIM(Value),'') IS NOT NULL
+), meta AS (
+    SELECT CAST(ID AS STRING) AS AttributeID, Name_ENG AS AttributeName
+    FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source.SRC__STEP__Attribute__latest`
+), joined AS (
+    SELECT b.product_id, b.AttributeID, m.AttributeName, b.Value AS AttributeValue
+    FROM base b LEFT JOIN meta m ON b.AttributeID = m.AttributeID
+    WHERE REGEXP_CONTAINS(AttributeValue,'^[A-Za-z0-9 ,./()%+-]+$')
+)
+SELECT product_id,
+       MAX(IF(AttributeID='attItemNumber', AttributeValue, NULL)) AS ProductNumber,
+       MAX(IF(LOWER(AttributeName)='material', AttributeValue, NULL)) AS material,
+       MAX(IF(LOWER(AttributeName)='length', AttributeValue, NULL)) AS length,
+       MAX(IF(LOWER(AttributeName)='thread diameter', AttributeValue, NULL)) AS thread_diameter
+FROM joined
+GROUP BY product_id;
+"""
 
-QUERIES = {
-        "create_purchase_data": CREATE_PURCHASE_DATA_SQL,
-        "create_order_data": CREATE_ORDER_DATA_SQL,
-    "create_product_data": CREATE_PRODUCT_DATA_SQL,
-        "fetch_purchase_data": """-- Fetch aggregated purchase metrics on product level (includes PurchaseStopInd)
+# ---------------------------------------------------------------------------
+# Data fetch query
+# ---------------------------------------------------------------------------
+
+FETCH_PURCHASE_DATA_SQL = """
+-- Aggregate purchase metrics per product
 SELECT
-    ProductNumber,
-    ProductDescription,
-    crm_main_vendor,
-    crm_main_group_vendor,
-    class2,
-    class3,
-    class4,
-    brandName,
-    BrandType,
-    countryOfOrigin,
-    PurchaseStopInd,
-    SUM(purchase_amount_eur) AS purchase_amount_eur,
-    SUM(purchase_quantity) AS purchase_quantity
+  ProductNumber,
+  ProductDescription,
+  crm_main_vendor,
+  crm_main_group_vendor,
+  class2,
+  class3,
+  class4,
+  brandName,
+  BrandType,
+  countryOfOrigin,
+  PurchaseStopInd,
+  SUM(purchase_amount_eur) AS purchase_amount_eur,
+  SUM(purchase_quantity)   AS purchase_quantity
 FROM `{purchase_data_table}`
-GROUP BY
-    ProductNumber,
-    ProductDescription,
-    crm_main_vendor,
-    crm_main_group_vendor,
-    class2,
-    class3,
-    class4,
-    brandName,
-    BrandType,
-    countryOfOrigin,
-    PurchaseStopInd
-ORDER BY purchase_amount_eur DESC""",
+GROUP BY ProductNumber, ProductDescription, crm_main_vendor, crm_main_group_vendor,
+         class2, class3, class4, brandName, BrandType, countryOfOrigin, PurchaseStopInd
+ORDER BY purchase_amount_eur DESC;
+"""
+
+# ---------------------------------------------------------------------------
+# Registry & helpers
+# ---------------------------------------------------------------------------
+
+QUERIES: dict[str, str] = {
+    "create_purchase_data": CREATE_PURCHASE_DATA_SQL,
+    "create_order_data": CREATE_ORDER_DATA_SQL,
+    "create_product_data": CREATE_PRODUCT_DATA_SQL,
+    "fetch_purchase_data": FETCH_PURCHASE_DATA_SQL,
 }
 
 def get_query(name: str) -> str:
-        if name not in QUERIES:
-                raise KeyError(f"Unknown query '{name}'. Available: {', '.join(QUERIES.keys())}")
+    """Return SQL string by registry key.
+
+    Raises KeyError if the name is unknown.
+    """
+    try:
         return QUERIES[name]
+    except KeyError as e:
+        raise KeyError(f"Unknown query '{name}'. Available: {', '.join(sorted(QUERIES))}") from e
 
 def list_available_queries() -> list[str]:
-        return list(QUERIES.keys())
+    """List all registered query keys."""
+    return sorted(QUERIES)

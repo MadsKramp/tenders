@@ -64,12 +64,31 @@ def fetch_product_details(
     if bq_client is None:
         raise ImportError("BigQuery client is missing.")
     candidate_ids = _build_candidate_ids(product_numbers)
+    # De-duplicate while preserving order
+    candidate_ids = list(dict.fromkeys(candidate_ids))
+    # Guard against explosive prefix expansion: if too large, restrict to a single canonical prefix
+    if len(candidate_ids) > 5000:
+        base_nums = _normalize_numbers(product_numbers)
+        candidate_ids = [f"ticGoldenItem-{b}" for b in base_nums]
+        if verbose:
+            print(f"Reduced candidate id list to {len(candidate_ids)} canonical prefixed ids to avoid oversized queries.")
     if not candidate_ids:
         return pd.DataFrame(columns=["ProductNumber", "detail_name", "detail_value"])
 
     def _run_batches(ids_list: List[str], names_filter: List[str]) -> List[pd.DataFrame]:
+        """Primary long-form attribute fetch path (expects AttributeName/AttributeValue columns).
+
+        If product_data does not have these columns (simplified schema), this path will return empty,
+        triggering the wide-schema fallback implemented below.
+        """
         names_literal_local = _bq_array_literal(names_filter) if names_filter else None
         frames_local: List[pd.DataFrame] = []
+        # Probe schema once to see if AttributeName exists
+        probe_sql = "SELECT * FROM `kramp-sharedmasterdata-prd.MadsH.product_data` LIMIT 1"
+        probe_df = bq_client.query(probe_sql)
+        has_long_form = probe_df is not None and not probe_df.empty and "AttributeName" in probe_df.columns and "AttributeValue" in probe_df.columns
+        if not has_long_form:
+            return frames_local  # empty triggers fallback
         for start in range(0, len(ids_list), chunk_size):
             batch_ids = ids_list[start:start + chunk_size]
             ids_literal = _bq_array_literal(batch_ids)
@@ -93,11 +112,65 @@ def fetch_product_details(
             frames_local.append(df_part)
         return frames_local
 
-    # First attempt with static allowed list
+    # First attempt with static allowed list (long form). If empty, perform wide fallback.
     primary_frames = _run_batches(candidate_ids, ALLOWED_DETAIL_NAMES)
     if primary_frames:
         df_primary = pd.concat(primary_frames, ignore_index=True)
         return df_primary.drop_duplicates(subset=["ProductNumber", "detail_name"], keep="first")
+
+    # ------------------------------------------------------------------
+    # Wide-schema fallback: product_data has one column per attribute.
+    # We fetch rows and reshape to long form matching expected output.
+    # ------------------------------------------------------------------
+    # Chunked wide-schema fallback (avoids oversized IN clause)
+    records: List[dict] = []
+    import re
+    def humanize(col: str) -> str:
+        base = col.strip()
+        if base.lower() == 'productnumber':
+            return 'ProductNumber'
+        # Convert snake_case to Title Case with spaces
+        parts = base.replace('__', '_').split('_')
+        parts = [p for p in parts if p]
+        title = ' '.join(p.capitalize() for p in parts)
+        return title
+    allowed_norm_map = {re.sub(r"[^a-z0-9]+", "", n.lower()): n for n in ALLOWED_DETAIL_NAMES}
+    for start in range(0, len(candidate_ids), chunk_size):
+        batch_ids = candidate_ids[start:start+chunk_size]
+        ids_literal = _bq_array_literal(batch_ids)
+        wide_sql = f"""
+        SELECT * FROM `kramp-sharedmasterdata-prd.MadsH.product_data`
+        WHERE product_id IN UNNEST({ids_literal})
+        """
+        wide_df = bq_client.query(wide_sql)
+        if wide_df is None or wide_df.empty:
+            continue
+        if "ProductNumber" in wide_df.columns:
+            wide_df["ProductNumber"] = wide_df["ProductNumber"].astype(str).str.strip()
+        else:
+            wide_df["ProductNumber"] = wide_df["product_id"].astype(str).str.replace("ticGoldenItem-", "", regex=False)
+        wide_df = wide_df[wide_df["ProductNumber"].astype(str).str.strip() != ""]
+        if wide_df.empty:
+            continue
+        # Attribute columns = all except identifiers
+        attr_cols = [c for c in wide_df.columns if c not in {"product_id", "ProductNumber"}]
+        # Build normalized map of existing columns
+        existing_norm = {re.sub(r"[^a-z0-9]+", "", c.lower()): c for c in attr_cols}
+        for _, row in wide_df.iterrows():
+            prod = str(row["ProductNumber"]).strip()
+            for norm_key, real_col in existing_norm.items():
+                val = row[real_col]
+                if pd.isna(val) or str(val).strip() == "":
+                    continue
+                display_name = allowed_norm_map.get(norm_key, humanize(real_col))
+                records.append({
+                    "ProductNumber": prod,
+                    "detail_name": display_name,
+                    "detail_value": str(val).strip()
+                })
+    if records:
+        df_wide_long = pd.DataFrame(records)
+        return df_wide_long.drop_duplicates(subset=["ProductNumber", "detail_name"], keep="first")
 
     # Diagnostic attribute name discovery
     if dynamic_attributes:
