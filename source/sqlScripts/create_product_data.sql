@@ -1,5 +1,5 @@
 -- ─────────────────────────────────────────────────────────────────────────────
--- 0) Declarations MUST be at the very start of the script
+-- 0) Declarations
 -- ─────────────────────────────────────────────────────────────────────────────
 DECLARE cal_has_brickid BOOL DEFAULT (
   SELECT COUNT(1) > 0
@@ -36,47 +36,34 @@ DECLARE gv_has_attrtype BOOL DEFAULT (
     AND column_name = 'AttributeType'
 );
 
-DECLARE join_on STRING;
-DECLARE select_h_brickid STRING;
-DECLARE select_h_classnode STRING;
-DECLARE select_attrtype_expr STRING;
-DECLARE sql STRING;
-
--- Build the safe join condition based on what exists
-SET join_on = IF(cal_has_brickid AND tec_has_brickid,
-                 'bat.BrickID = pb.BrickID',
-                 IF(cal_has_classnode AND tec_has_classnode,
-                    'bat.ClassificationNodeID = pb.ClassificationNodeID',
-                    '1 = 0'  -- safe fallback to avoid a bad cartesian join
-                 ));
-
--- Only reference columns that actually exist; otherwise provide a NULL alias
-SET select_h_brickid   = IF(tec_has_brickid,   ', h.BrickID',              ', NULL AS BrickID');
-SET select_h_classnode = IF(tec_has_classnode, ', h.ClassificationNodeID', ', NULL AS ClassificationNodeID');
-SET select_attrtype_expr = IF(gv_has_attrtype,
-                              'a.AttributeType AS AttributeType',
-                              'NULL AS AttributeType');
-
 -- ─────────────────────────────────────────────────────────────────────────────
--- 1) Create the target schema if needed
+-- 1) Target schema
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE SCHEMA IF NOT EXISTS `kramp-sharedmasterdata-prd.MadsH`;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 2) Stage sources as temp tables (keeps the final SELECT simple)
+-- 2) Stage sources as temp tables (normalize keys to STRING)
 -- ─────────────────────────────────────────────────────────────────────────────
+-- rel: force product_id to STRING so all downstream joins are string-safe
 CREATE TEMP TABLE rel AS
-SELECT *
+SELECT * REPLACE (CAST(product_id AS STRING) AS product_id)
 FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_customquery.CMQ__product_wholesale`;
 
+-- v: force ID / AttributeID / Value to STRING
 CREATE TEMP TABLE v AS
-SELECT *
+SELECT * REPLACE (
+  CAST(ID AS STRING) AS ID,
+  CAST(AttributeID AS STRING) AS AttributeID,
+  CAST(Value AS STRING) AS Value
+)
 FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source.SRC__STEP__Value__latest`;
 
+-- gv: force ID to STRING so it matches v.AttributeID
 CREATE TEMP TABLE gv AS
-SELECT *
+SELECT * REPLACE (CAST(ID AS STRING) AS ID)
 FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source.SRC__STEP__Attribute__latest`;
 
+-- cal / tec as-is (we'll branch below to avoid touching missing cols)
 CREATE TEMP TABLE cal AS
 SELECT *
 FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source.SRC__STEP__Brick_Attribute_Template__latest`;
@@ -86,48 +73,128 @@ SELECT *
 FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_source.SRC__STEP__Technical_Item_Classification_Hierarchy__latest`;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 3) Build final table with dynamic SQL that references only existing columns
---    and pivots attributes to columns (plus ProductNumber)
+-- 2b) prod_bricks with safe columns (never reference missing cols)
+--     product_id is already STRING (from rel). GoldenItemID → STRING.
 -- ─────────────────────────────────────────────────────────────────────────────
-SET sql = '''
-CREATE OR REPLACE TABLE `kramp-sharedmasterdata-prd.MadsH.product_data` AS
-WITH
-prod_bricks AS (
+IF tec_has_brickid AND tec_has_classnode THEN
+  CREATE TEMP TABLE prod_bricks AS
   SELECT
-    p.*''' || select_h_brickid || select_h_classnode || '''
+    p.*,
+    CAST(h.BrickID AS STRING)              AS BrickID,
+    CAST(h.ClassificationNodeID AS STRING) AS ClassificationNodeID
   FROM rel AS p
   LEFT JOIN tec AS h
-    ON p.product_id = h.GoldenItemID
-),
+    ON p.product_id = CAST(h.GoldenItemID AS STRING);
+ELSEIF tec_has_brickid AND NOT tec_has_classnode THEN
+  CREATE TEMP TABLE prod_bricks AS
+  SELECT
+    p.*,
+    CAST(h.BrickID AS STRING) AS BrickID,
+    NULL AS ClassificationNodeID
+  FROM rel AS p
+  LEFT JOIN tec AS h
+    ON p.product_id = CAST(h.GoldenItemID AS STRING);
+ELSEIF NOT tec_has_brickid AND tec_has_classnode THEN
+  CREATE TEMP TABLE prod_bricks AS
+  SELECT
+    p.*,
+    NULL AS BrickID,
+    CAST(h.ClassificationNodeID AS STRING) AS ClassificationNodeID
+  FROM rel AS p
+  LEFT JOIN tec AS h
+    ON p.product_id = CAST(h.GoldenItemID AS STRING);
+ELSE
+  CREATE TEMP TABLE prod_bricks AS
+  SELECT
+    p.*,
+    NULL AS BrickID,
+    NULL AS ClassificationNodeID
+  FROM rel AS p;
+END IF;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 2c) cal_ready with safe STRING keys (so bat.* names always exist)
+-- ─────────────────────────────────────────────────────────────────────────────
+IF cal_has_brickid AND cal_has_classnode THEN
+  CREATE TEMP TABLE cal_ready AS
+  SELECT CAST(AttributeID AS STRING) AS AttributeID,
+         CAST(BrickID AS STRING)     AS BrickID,
+         CAST(ClassificationNodeID AS STRING) AS ClassificationNodeID
+  FROM cal;
+ELSEIF cal_has_brickid AND NOT cal_has_classnode THEN
+  CREATE TEMP TABLE cal_ready AS
+  SELECT CAST(AttributeID AS STRING) AS AttributeID,
+         CAST(BrickID AS STRING)     AS BrickID,
+         NULL AS ClassificationNodeID
+  FROM cal;
+ELSEIF NOT cal_has_brickid AND cal_has_classnode THEN
+  CREATE TEMP TABLE cal_ready AS
+  SELECT CAST(AttributeID AS STRING) AS AttributeID,
+         NULL AS BrickID,
+         CAST(ClassificationNodeID AS STRING) AS ClassificationNodeID
+  FROM cal;
+ELSE
+  CREATE TEMP TABLE cal_ready AS
+  SELECT CAST(AttributeID AS STRING) AS AttributeID,
+         NULL AS BrickID,
+         NULL AS ClassificationNodeID
+  FROM cal;
+END IF;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 3) Final table (English-only filter + pivot + ProductNumber)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE OR REPLACE TABLE `kramp-sharedmasterdata-prd.MadsH.product_data` AS
+WITH
 value_expected AS (
   SELECT
-    pb.product_id,
-    pb.BrickID,
-    pb.ClassificationNodeID,
-    v.ID            AS step_id,
-    v.AttributeID,
-    v.Value         AS AttributeValue
+    pb.product_id,             -- STRING
+    pb.BrickID,                -- STRING or NULL
+    pb.ClassificationNodeID,   -- STRING or NULL
+    v.ID          AS step_id,           -- STRING
+    v.AttributeID AS AttributeID,       -- STRING
+    v.Value       AS AttributeValue     -- STRING
   FROM prod_bricks AS pb
   LEFT JOIN v
     ON v.ID = pb.product_id
-   AND STARTS_WITH(v.ID, "ticGoldenItem")
-  LEFT JOIN cal AS bat
-    ON ''' || join_on || '''
-   AND bat.AttributeID = v.AttributeID
+   AND STARTS_WITH(v.ID, 'ticGoldenItem')
+  LEFT JOIN cal_ready AS bat
+    ON bat.AttributeID = v.AttributeID
+   AND (
+        (tec_has_brickid   AND cal_has_brickid   AND bat.BrickID = pb.BrickID)
+     OR (tec_has_classnode AND cal_has_classnode AND bat.ClassificationNodeID = pb.ClassificationNodeID)
+   )
   WHERE pb.product_id IS NOT NULL
 ),
+
 value_with_meta AS (
   SELECT
     ve.product_id,
     ve.BrickID,
-    ve.AttributeID,
-    a.Name_ENG      AS AttributeName,
-    ''' || select_attrtype_expr || ''',
+    ve.AttributeID,  -- STRING
+    a.Name_ENG AS AttributeName,
+    IF(gv_has_attrtype, a.AttributeType, NULL) AS AttributeType,
     ve.AttributeValue
   FROM value_expected AS ve
   LEFT JOIN gv AS a
-    ON ve.AttributeID = a.ID
+    ON ve.AttributeID = a.ID      -- gv.ID was normalized to STRING above
   WHERE ve.AttributeID IS NOT NULL
+),
+
+-- Keep only English attributes (Name_ENG present) and values that look English; drop empty values
+english_only AS (
+  SELECT
+    product_id,
+    BrickID,
+    AttributeID,
+    AttributeName,
+    AttributeType,
+    CAST(NULLIF(TRIM(AttributeValue), '') AS STRING) AS AttributeValue
+  FROM value_with_meta
+  WHERE AttributeName IS NOT NULL
+    AND NULLIF(TRIM(AttributeValue), '') IS NOT NULL
+    -- allow Latin letters/digits/common punctuation (filters out Cyrillic etc.)
+    AND REGEXP_CONTAINS(AttributeValue, '^[A-Za-z0-9 ,./()%+-]+$')
 )
 
 -- Final wide table: one row per product_id (and BrickID), with ProductNumber and requested attributes
@@ -164,9 +231,6 @@ SELECT
   MAX(IF(LOWER(AttributeName) = 'head type'                                 OR AttributeID = 'attHeadType',            AttributeValue, NULL)) AS head_type,
   MAX(IF(LOWER(AttributeName) = 'thread length'                             OR AttributeID = 'attThreadLength',        AttributeValue, NULL)) AS thread_length
 
-FROM value_with_meta
+FROM english_only
 GROUP BY product_id, BrickID
-ORDER BY product_id
-''';
-
-EXECUTE IMMEDIATE sql;
+ORDER BY product_id;
