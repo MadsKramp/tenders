@@ -50,6 +50,7 @@ def fetch_product_details(
     dynamic_attributes: bool = True,
     attribute_sample_limit: int = 50,
     verbose: bool = True,
+    enrichment_table: str = "kramp-sharedmasterdata-prd.MadsH.product_enrichment_table",
 ) -> pd.DataFrame:
     """Fetch product attribute details for given product numbers with multi-prefix fallback.
 
@@ -64,6 +65,37 @@ def fetch_product_details(
     if bq_client is None:
         raise ImportError("BigQuery client is missing.")
     candidate_ids = _build_candidate_ids(product_numbers)
+    if verbose:
+        print(f"Detail fetch: {len(candidate_ids)} candidate ids (first 8): {candidate_ids[:8]}")
+
+    # Attempt direct enrichment table pull first (materialized earlier)
+    try:
+        enrich_df = bq_client.query(f"SELECT * FROM `{enrichment_table}` WHERE ProductNumber IN UNNEST({_bq_array_literal(_normalize_numbers(product_numbers))})")
+        if enrich_df is not None and not enrich_df.empty and "ProductNumber" in enrich_df.columns:
+            # Reshape like long-form expected: pivot later in get_product_details_mapping
+            cols = [c for c in enrich_df.columns if c != "ProductNumber"]
+            long_records = []
+            for _, row in enrich_df.iterrows():
+                pn = str(row["ProductNumber"]).strip()
+                for c in cols:
+                    val = row[c]
+                    if pd.isna(val) or str(val).strip() == "":
+                        continue
+                    long_records.append({"ProductNumber": pn, "detail_name": c, "detail_value": str(val).strip()})
+            if long_records:
+                df_enrich_long = pd.DataFrame(long_records).drop_duplicates(subset=["ProductNumber","detail_name"], keep="first")
+                if verbose:
+                    print(f"Enrichment table hit: {df_enrich_long['detail_name'].nunique()} attributes across {df_enrich_long['ProductNumber'].nunique()} products.")
+                return df_enrich_long
+            else:
+                if verbose:
+                    print("Enrichment table contained rows but no non-empty attribute values.")
+        else:
+            if verbose:
+                print("Enrichment table empty or missing ProductNumber column; falling back to dynamic fetch.")
+    except Exception as e:
+        if verbose:
+            print("Enrichment table query failed; falling back to dynamic fetch:", e)
     # De-duplicate while preserving order
     candidate_ids = list(dict.fromkeys(candidate_ids))
     # Guard against explosive prefix expansion: if too large, restrict to a single canonical prefix
@@ -94,14 +126,14 @@ def fetch_product_details(
             ids_literal = _bq_array_literal(batch_ids)
             name_clause = f"AND AttributeName IN UNNEST({names_literal_local})" if names_literal_local else ""
             sql = f"""
-            SELECT
-              REPLACE(product_id, 'ticGoldenItem-', '') AS ProductNumber,
-              AttributeName AS detail_name,
-              AttributeValue AS detail_value
-            FROM `kramp-sharedmasterdata-prd.MadsH.product_data`
-            WHERE product_id IN UNNEST({ids_literal})
-              {name_clause}
-            """
+SELECT
+  REGEXP_REPLACE(product_id, r'^(ticGoldenItem-|ticArticle-|ticItem-)', '') AS ProductNumber,
+  AttributeName AS detail_name,
+  AttributeValue AS detail_value
+FROM `kramp-sharedmasterdata-prd.MadsH.product_data`
+WHERE product_id IN UNNEST({ids_literal})
+  {name_clause}
+"""
             df_part = bq_client.query(sql)
             if df_part is None or df_part.empty:
                 continue
@@ -116,6 +148,8 @@ def fetch_product_details(
     primary_frames = _run_batches(candidate_ids, ALLOWED_DETAIL_NAMES)
     if primary_frames:
         df_primary = pd.concat(primary_frames, ignore_index=True)
+        if verbose:
+            print(f"Long-form attributes fetched: {len(df_primary)} rows, {df_primary['detail_name'].nunique()} distinct names.")
         return df_primary.drop_duplicates(subset=["ProductNumber", "detail_name"], keep="first")
 
     # ------------------------------------------------------------------
@@ -148,7 +182,7 @@ def fetch_product_details(
         if "ProductNumber" in wide_df.columns:
             wide_df["ProductNumber"] = wide_df["ProductNumber"].astype(str).str.strip()
         else:
-            wide_df["ProductNumber"] = wide_df["product_id"].astype(str).str.replace("ticGoldenItem-", "", regex=False)
+            wide_df["ProductNumber"] = wide_df["product_id"].astype(str).str.replace(r"^(ticGoldenItem-|ticArticle-|ticItem-)", "", regex=True)
         wide_df = wide_df[wide_df["ProductNumber"].astype(str).str.strip() != ""]
         if wide_df.empty:
             continue
@@ -170,6 +204,8 @@ def fetch_product_details(
                 })
     if records:
         df_wide_long = pd.DataFrame(records)
+        if verbose:
+            print(f"Wide-schema fallback: {len(df_wide_long)} attribute rows collected across {df_wide_long['ProductNumber'].nunique()} products.")
         return df_wide_long.drop_duplicates(subset=["ProductNumber", "detail_name"], keep="first")
 
     # Diagnostic attribute name discovery
@@ -193,12 +229,16 @@ def fetch_product_details(
                 secondary_frames = _run_batches(candidate_ids, intersect)
                 if secondary_frames:
                     df_secondary = pd.concat(secondary_frames, ignore_index=True)
+                    if verbose:
+                        print(f"Secondary fetch (discovered attributes): {len(df_secondary)} rows.")
                     return df_secondary.drop_duplicates(subset=["ProductNumber", "detail_name"], keep="first")
         else:
             if verbose:
                 print("Diagnostic: no attributes found for sampled product ids.")
 
     # Final empty result
+    if verbose:
+        print("No product attribute details found after all strategies.")
     return pd.DataFrame(columns=["ProductNumber", "detail_name", "detail_value"])
 
 def pivot_product_details(df_details: pd.DataFrame) -> pd.DataFrame:

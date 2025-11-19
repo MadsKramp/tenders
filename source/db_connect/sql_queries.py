@@ -113,7 +113,10 @@ QUERIES: dict[str, str] = {
     "create_purchase_data": CREATE_PURCHASE_DATA_SQL,
     "create_order_data": CREATE_ORDER_DATA_SQL,
     "create_product_data": CREATE_PRODUCT_DATA_SQL,
-    "fetch_purchase_data": FETCH_PURCHASE_DATA_SQL,
+      "fetch_purchase_data": FETCH_PURCHASE_DATA_SQL,
+      "fetch_purchase_data_enriched": """
+      SELECT * FROM {purchase_data_enriched_table}
+      """,
 }
 
 def get_query(name: str) -> str:

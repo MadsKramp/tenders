@@ -29,6 +29,12 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 # ---------------------------------------------------------------------------
+__all__ = [
+    'preprocess_detailed_data',
+    'compute_abc_tiers',
+    'fetch_purchase_data_enriched',
+    # add other public functions as needed
+]
 # Load helper modules from attachments (with filesystem fallback)
 # ---------------------------------------------------------------------------
 try:
@@ -108,9 +114,9 @@ PROJECT_ID = os.getenv('PROJECT_ID')
 DATASET_ID = os.getenv('DATASET_ID')
 TABLE_ID = os.getenv('TABLE_ID')
 if PROJECT_ID and DATASET_ID and TABLE_ID:
-    PURCHASE_DATA_TABLE = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+    PURCHASE_DATA_ENRICHED_TABLE = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
 else:
-    PURCHASE_DATA_TABLE = None
+    PURCHASE_DATA_ENRICHED_TABLE = None
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -213,7 +219,7 @@ def _safe_apply_prepare_field_names(df: pd.DataFrame) -> pd.DataFrame:
 # Data fetching (optional)
 # ---------------------------------------------------------------------------
 
-def fetch_purchase_data(bq_client: 'BigQueryConnector', limit: Optional[int] = None) -> pd.DataFrame:
+def fetch_purchase_data_enriched(bq_client: 'BigQueryConnector', limit: Optional[int] = None) -> pd.DataFrame:
     # Lazy import in case initial module import failed (e.g., due to transient encoding issues)
     global BigQueryConnector, get_query
     if BigQueryConnector is None or get_query is None:
@@ -224,10 +230,10 @@ def fetch_purchase_data(bq_client: 'BigQueryConnector', limit: Optional[int] = N
             get_query = _get_query
         except Exception as e:
             raise ImportError("BigQuery dependencies not available after lazy import attempt: " + str(e))
-    if not PURCHASE_DATA_TABLE:
+    if not PURCHASE_DATA_ENRICHED_TABLE:
         raise EnvironmentError("PROJECT_ID/DATASET_ID/TABLE_ID env vars are not set.")
     print("Fetching purchase data from BigQuery...")
-    query = get_query('fetch_purchase_data').format(purchase_data_table=PURCHASE_DATA_TABLE)
+    query = get_query('fetch_purchase_data_enriched').format(purchase_data_enriched_table=PURCHASE_DATA_ENRICHED_TABLE)
     if limit is not None:
         query += f" LIMIT {limit}"
     df = bq_client.query(query)
@@ -532,7 +538,7 @@ __all__ = [
     'fmt_eur','parse_eur','is_valid_eur_format','add_eur_suffix','fmt_units','parse_units','is_valid_units_format',
     'preprocess_field_values','harmonize_field_values','prepare_field_values',
     # Fetch & preprocess
-    'fetch_purchase_data','preprocess_detailed_data',
+    'fetch_purchase_data_enriched','preprocess_detailed_data',
     # Tiering
     'compute_abc_tiers','compute_kmeans_tiers','compute_gmm_tiers','summarize_tiers',
     # Analyses / viz
