@@ -117,18 +117,12 @@ def resolve_class3(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
         ordered = generic_class_cols
         mapping = {}
         if len(ordered) >= 1:
-            mapping[ordered[0]] = "Class2" if len(ordered) > 1 else "Class3"
+            mapping[ordered[0]] = "Class3"
         if len(ordered) >= 2:
-            mapping[ordered[1]] = "Class3"
-        if len(ordered) >= 3:
-            mapping[ordered[2]] = "Class4"
+            mapping[ordered[1]] = "Class4"
         out = out.rename(columns=mapping)
         if "Class3" not in out.columns:
-            synth_source = next((c for c in ["Class2", "Class4"] if c in out.columns), None)
-            if synth_source:
-                out["Class3"] = out[synth_source]
-            else:
-                raise KeyError(f"Could not synthesize Class3; columns: {out.columns.tolist()}")
+            raise KeyError(f"Could not synthesize Class3; columns: {out.columns.tolist()}")
         return out, "Class3"
 
     raise KeyError(f"Could not locate a Class3-like column. Available columns: {df.columns.tolist()}")

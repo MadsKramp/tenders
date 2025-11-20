@@ -1,3 +1,6 @@
+-- Check brand filter, default is 'Kramp'
+-- Check level2 filter below, default is 'Threaded Fasteners'
+
 -- Clean target
 CREATE SCHEMA IF NOT EXISTS `kramp-sharedmasterdata-prd.MadsH`;
 DROP TABLE IF EXISTS `kramp-sharedmasterdata-prd.MadsH.purchase_data`;
@@ -62,8 +65,7 @@ SELECT *
 FROM src
 WHERE crm_main_group_vendor IS NOT NULL
   AND year_authorization > 2020
-  AND class2_code = '54'  -- <-- only keep class2 = 54
-;
+  AND class2_code = '54';
 
 -- Second temp table: brand mapping for only class2=54 and allowed PLM statuses
 CREATE TEMP TABLE brand_table AS
@@ -84,8 +86,7 @@ WHERE p.class2_code = '54'
     '600 - Phasing out phase in progress',
     '700 - Phased out phase in progress',
     '750 - Phased out phase completed'
-  )
-;
+  );
 
 -- Purchase stop status per product (active vs stopped)
 CREATE TEMP TABLE products_purchasestop AS
@@ -103,7 +104,15 @@ LEFT JOIN `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__
 WHERE c.CompanyShortDescription LIKE 'Kramp %'
 GROUP BY b.ProductNumber;
 
--- Final table: only class2=54 rows plus brand identifier
+-- Sales rounding per ProductNumber (deduped)
+CREATE TEMP TABLE sales_rounding AS
+SELECT
+  ProductNumber,
+  ANY_VALUE(salesRounding) AS salesRounding
+FROM `kramp-sales-prd.kramp_sales_customquery.CUQ__TBL__externalSales_enriched`
+GROUP BY ProductNumber;
+
+-- Final table: only class2=54 rows, brand identifier, purchase-stop active, brand/level2 filters, + salesRounding
 CREATE TABLE `kramp-sharedmasterdata-prd.MadsH.purchase_data` AS
 SELECT
   pd.year_authorization,
@@ -155,10 +164,15 @@ SELECT
   pd.cn_code,
   pd.contract_type,
   bt.key_brand_identifier,
-  ps.PurchaseStopInd
+  ps.PurchaseStopInd,
+  sr.salesRounding
 FROM purchase_data AS pd
 LEFT JOIN brand_table AS bt
   ON CAST(pd.ProductNumber AS STRING) = CAST(bt.ProductNumber AS STRING)
 LEFT JOIN products_purchasestop AS ps
   ON CAST(pd.ProductNumber AS STRING) = CAST(ps.ProductNumber AS STRING)
-WHERE ps.PurchaseStopInd = 'N';
+LEFT JOIN sales_rounding AS sr
+  ON CAST(pd.ProductNumber AS STRING) = CAST(sr.ProductNumber AS STRING)
+WHERE ps.PurchaseStopInd = 'N'
+  AND LOWER(TRIM(pd.brandName)) = 'kramp'
+  AND LOWER(TRIM(pd.level2)) = 'threaded fasteners';

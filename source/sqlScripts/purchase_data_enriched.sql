@@ -1,4 +1,6 @@
 -- If you want data for a specific Class2, change create_purchase_data.sql
+-- Check brand filter in create_purchase_data.sql, default is 'kramp'
+-- Check level2 filter in create_purchase_data.sql, default is 'Threaded Fasteners'
 -- Create a combined table joining purchase and product data
 CREATE OR REPLACE TABLE `kramp-sharedmasterdata-prd.MadsH.purchase_data_enriched` AS
 SELECT
@@ -82,8 +84,9 @@ SELECT
   p.cn_code,
   p.contract_type,
   p.key_brand_identifier,
-  p.PurchaseStopInd
+  p.PurchaseStopInd,
+  p.salesRounding,
 
 FROM `kramp-sharedmasterdata-prd.MadsH.purchase_data` AS p
 LEFT JOIN `kramp-sharedmasterdata-prd.MadsH.product_data` AS d
-  ON SAFE_CAST(p.ProductNumber AS STRING) = SAFE_CAST(d.ProductNumber AS STRING);
+  ON SAFE_CAST(p.ProductNumber AS STRING) = SAFE_CAST(d.ProductNumber AS STRING)

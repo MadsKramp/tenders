@@ -31,10 +31,45 @@ import seaborn as sns
 # ---------------------------------------------------------------------------
 __all__ = [
     'preprocess_detailed_data',
+    'make_spend_col',
     'compute_abc_tiers',
     'fetch_purchase_data_enriched',
     # add other public functions as needed
 ]
+# ---------------------------------------------------------------------------
+# Spend column normalization utility
+# ---------------------------------------------------------------------------
+def make_spend_col(df: pd.DataFrame, prefer: str = 'Amount Eur_numeric') -> tuple[pd.DataFrame, str]:
+    """
+    Ensures a numeric spend column exists and returns (df, spend_col).
+    Prefers cleaned numeric columns (e.g., 'Amount Eur_numeric') if present.
+    Prints diagnostics after conversion.
+    """
+    candidates = [
+        prefer,
+        'Amount Eur_numeric',
+        'purchase_amount_eur',
+        'PurchaseAmountEUR',
+        'purchase_amount',
+        'amount_eur',
+        'AmountEUR',
+        'amount',
+        'total_spend',
+        'TotalSpend',
+        'Total Spend'
+    ]
+    col = None
+    for c in candidates:
+        if c in df.columns:
+            col = c
+            break
+    if col is None:
+        raise ValueError("No spend column found in dataset.")
+    out = df.copy()
+    out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+    print(f"make_spend_col: Using spend column '{col}' | non-null count: {out[col].notnull().sum()} | stats:")
+    print(out[col].describe())
+    return out, col
 # Load helper modules from attachments (with filesystem fallback)
 # ---------------------------------------------------------------------------
 try:

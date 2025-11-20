@@ -11,16 +11,17 @@ __all__ = ["export_year_split_purchase_quantity", "fetch_year_purchase_quantity"
 
 YEAR_QTY_QUERY_TEMPLATE = """
 SELECT
-  ProductNumber,
-  ANY_VALUE(ProductDescription) AS ProductDescription,  -- avoid duplicate rows when description varies by year
-  class3 AS Class3,
-  -- Robust year derivation: numeric year_authorization stays; try date parse; fallback to first 4 chars
-  CASE
-    WHEN REGEXP_CONTAINS(CAST(year_authorization AS STRING), r'^[0-9]{{4}}$') THEN CAST(year_authorization AS INT64)
-    WHEN SAFE.PARSE_DATE('%Y-%m-%d', CAST(year_authorization AS STRING)) IS NOT NULL THEN EXTRACT(YEAR FROM SAFE.PARSE_DATE('%Y-%m-%d', CAST(year_authorization AS STRING)))
-    ELSE CAST(SUBSTR(CAST(year_authorization AS STRING),1,4) AS INT64)
-  END AS Year,
-  SUM(purchase_quantity) AS PurchaseQuantity
+    ProductNumber,
+    ANY_VALUE(ProductDescription) AS ProductDescription,  -- avoid duplicate rows when description varies by year
+    class3 AS Class3,
+    ANY_VALUE(salesRounding) AS salesRounding,
+    -- Robust year derivation: numeric year_authorization stays; try date parse; fallback to first 4 chars
+    CASE
+        WHEN REGEXP_CONTAINS(CAST(year_authorization AS STRING), r'^[0-9]{{4}}$') THEN CAST(year_authorization AS INT64)
+        WHEN SAFE.PARSE_DATE('%Y-%m-%d', CAST(year_authorization AS STRING)) IS NOT NULL THEN EXTRACT(YEAR FROM SAFE.PARSE_DATE('%Y-%m-%d', CAST(year_authorization AS STRING)))
+        ELSE CAST(SUBSTR(CAST(year_authorization AS STRING),1,4) AS INT64)
+    END AS Year,
+    SUM(purchase_quantity) AS PurchaseQuantity
 FROM `{table}`
 {where_clause}
 GROUP BY ProductNumber, Class3, Year
@@ -33,38 +34,9 @@ def _bq_array_literal(values: list[str]) -> str:
     return "[" + ",".join(q(v) for v in values) + "]"
 
 def fetch_year_purchase_quantity(bq,
-                                 table: str = "kramp-sharedmasterdata-prd.MadsH.purchase_data",
-                                 level2_filter: Optional[list[str]] = None,
-                                 level2_column_candidates: tuple[str, ...] = ("class2","Class2","level2","Level2")) -> pd.DataFrame:
-    """Fetch raw year-level purchase quantity aggregated per product with optional Level2 filter.
-
-    level2_filter: list of Level2/category names (e.g. ['Threaded Fasteners']). If provided we attempt to
-    locate a Level2 column (from candidates) in the source table via probe. If found, add WHERE clause
-    restricting rows to those Level2 values.
-    """
+                                 table: str = "kramp-sharedmasterdata-prd.MadsH.purchase_data") -> pd.DataFrame:
+    """Fetch raw year-level purchase quantity aggregated per product."""
     where_clause = ""
-    if level2_filter:
-        # Probe table for available columns to pick correct Level2 column name
-        try:
-            probe_df = bq.query(f"SELECT * FROM `{table}` LIMIT 1")
-            if probe_df is not None and not probe_df.empty:
-                cols = set(probe_df.columns)
-                chosen = None
-                for cand in level2_column_candidates:
-                    if cand in cols:
-                        chosen = cand
-                        break
-                if chosen:
-                    # Build array literal
-                    values = [str(v).strip() for v in level2_filter if str(v).strip()]
-                    if values:
-                        where_clause = f"WHERE {chosen} IN UNNEST({_bq_array_literal(values)})"
-                else:
-                    print("Level2 filter ignored: no candidate Level2 column present in table.")
-            else:
-                print("Level2 filter probe returned empty; skipping Level2 restriction.")
-        except Exception as e:
-            print("Level2 probe failed; proceeding without Level2 filter:", e)
     query = YEAR_QTY_QUERY_TEMPLATE.format(table=table, where_clause=where_clause)
     try:
         df_year = bq.query(query)
@@ -79,21 +51,16 @@ def export_year_split_purchase_quantity(bq,
                                         fmt_thousands: bool = True,
                                         merged_header_label: str = "PurchaseQuantity",
                                         segmentation_df: Optional[pd.DataFrame] = None,
-                                        segmentation_col: str = "abc_tier",
-                                        level2_filter: Optional[list[str]] = None) -> List[str]:
+                                        segmentation_col: str = "abc_tier") -> List[str]:
     """
     Query purchase data and export per-Class3 Excel files with year columns.
-
-    Supports optional Level2 filtering: pass a list of Level2/category names (e.g. ['54 | Fasteners'])
-    via the level2_filter argument to restrict exports to products matching those categories.
-    The function will auto-detect the correct Level2 column in the source table.
 
     Returns list of file paths written. PurchaseQuantity columns are formatted with
     thousand separators if fmt_thousands=True.
     """
     os.makedirs(output_dir, exist_ok=True)
-    # Fetch data with optional Level2 filter
-    df_year = fetch_year_purchase_quantity(bq, table=table, level2_filter=level2_filter)
+    # Fetch data
+    df_year = fetch_year_purchase_quantity(bq, table=table)
     if df_year is None:
         print("Query returned None.")
         return []
@@ -105,7 +72,7 @@ def export_year_split_purchase_quantity(bq,
     df_year["Year"] = pd.to_numeric(df_year["Year"], errors="coerce").astype("Int64")
     pivot = (
         df_year.pivot_table(
-            index=["Class3", "ProductNumber", "ProductDescription"],
+            index=["Class3", "ProductNumber", "ProductDescription", "salesRounding"],
             columns="Year",
             values="PurchaseQuantity",
             aggfunc="sum",
@@ -131,26 +98,56 @@ def export_year_split_purchase_quantity(bq,
     combined_year_cols = [combined_map[yc] for yc in year_cols_str]
 
     written: List[str] = []
-    # Prepare segmentation mapping if provided
+    # Prepare segmentation and enrichment mapping if provided
     seg_map = None
-    if segmentation_df is not None and "ProductNumber" in segmentation_df.columns and segmentation_col in segmentation_df.columns:
-        try:
-            seg_map = (segmentation_df[["ProductNumber", segmentation_col]]
-                       .drop_duplicates()
-                       .assign(ProductNumber=lambda d: d["ProductNumber"].astype(str).str.strip()))
-        except Exception:
-            seg_map = None
+    enrichment_map = None
+    ENRICHMENT_FIELDS = [
+        'head_shape', 'thread_type', 'head_height', 'head_outside_diameter_width', 'quality',
+        'surface_treatment', 'material', 'din_standard', 'weight_per_100_pcs', 'content_in_sales_unit',
+        'thread_diameter', 'length', 'height', 'total_height', 'width', 'iso_standard', 'inside_diameter',
+        'outside_diameter', 'thickness', 'designed_for_thread', 'total_length', 'head_type', 'thread_length'
+    ]
+    if segmentation_df is not None and "ProductNumber" in segmentation_df.columns:
+        # Prepare segmentation mapping
+        if segmentation_col and segmentation_col in segmentation_df.columns:
+            try:
+                seg_map = (segmentation_df[["ProductNumber", segmentation_col]]
+                           .drop_duplicates()
+                           .assign(ProductNumber=lambda d: d["ProductNumber"].astype(str).str.strip()))
+            except Exception:
+                seg_map = None
+        # Prepare enrichment mapping
+        enrichment_fields_present = [f for f in ENRICHMENT_FIELDS if f in segmentation_df.columns]
+        if enrichment_fields_present:
+            try:
+                enrichment_map = (segmentation_df[["ProductNumber"] + enrichment_fields_present]
+                                  .drop_duplicates()
+                                  .assign(ProductNumber=lambda d: d["ProductNumber"].astype(str).str.strip()))
+            except Exception:
+                enrichment_map = None
+    # Merge enrichment fields into pivot before export
+    if enrichment_map is not None:
+        pivot = pivot.merge(enrichment_map, on="ProductNumber", how="left")
+    # Merge segmentation column if not present
+    if seg_map is not None and segmentation_col and segmentation_col not in pivot.columns:
+        pivot = pivot.merge(seg_map, on="ProductNumber", how="left")
     for c3, group in pivot.groupby("Class3"):
-        sub = group[["ProductNumber", "ProductDescription"] + combined_year_cols].copy()
-        if seg_map is not None:
-            sub["ProductNumber"] = sub["ProductNumber"].astype(str).str.strip()
-            sub = sub.merge(seg_map, on="ProductNumber", how="left")
-            if segmentation_col in sub.columns:
-                # Reorder columns to place segmentation before year columns
-                sub = sub.reindex(columns=["ProductNumber", "ProductDescription", segmentation_col] + combined_year_cols)
-        # enforce integers
+        # Start with required columns
+        base_cols = ["ProductNumber", "ProductDescription", "salesRounding"]
+        # Add segmentation if available and present in group
+        if segmentation_col and segmentation_col in group.columns:
+            base_cols.append(segmentation_col)
+        # Add enrichment fields if present in group
+        enrichment_present = [f for f in ENRICHMENT_FIELDS if f in group.columns]
+        # Final columns: base + enrichment + year cols
+        export_cols = base_cols + enrichment_present + combined_year_cols
+        # Only include columns that exist in the group
+        export_cols = [col for col in export_cols if col in group.columns]
+        sub = group[export_cols].copy()
+        # enforce integers for year columns
         for yc in combined_year_cols:
-            sub[yc] = pd.to_numeric(sub[yc], errors="coerce").fillna(0).round(0).astype(int)
+            if yc in sub.columns:
+                sub[yc] = pd.to_numeric(sub[yc], errors="coerce").fillna(0).round(0).astype(int)
         fname = safe_filename(f"ABC_Segmentation_{c3}_years") + ".xlsx"
         path = os.path.join(output_dir, fname)
 
