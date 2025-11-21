@@ -46,6 +46,7 @@ def fetch_year_purchase_quantity(bq,
     return df_year
 
 def export_year_split_purchase_quantity(bq,
+                                            # Remove duplicate ProductNumber columns after merge (keep first)
                                         output_dir: str,
                                         table: str = "kramp-sharedmasterdata-prd.MadsH.purchase_data",
                                         fmt_thousands: bool = True,
@@ -65,14 +66,59 @@ def export_year_split_purchase_quantity(bq,
         print("Query returned None.")
         return []
 
-    if df_year is None or df_year.empty:
+    if df_year.empty:
         print("No year-level purchase quantity data; nothing exported.")
         return []
 
     df_year["Year"] = pd.to_numeric(df_year["Year"], errors="coerce").astype("Int64")
+    REQUIRED_EXPORT_FIELDS = [
+        'year_authorization', 'ProductNumber', 'ProductDescription', 'purchase_amount_eur',
+        'head_shape', 'thread_type', 'head_height', 'head_outside_diameter_width', 'quality',
+        'surface_treatment', 'material', 'din_standard', 'weight_per_100_pcs', 'content_in_sales_unit',
+        'thread_diameter', 'length', 'height', 'total_height', 'width', 'iso_standard', 'inside_diameter',
+        'outside_diameter', 'thickness', 'designed_for_thread', 'total_length', 'head_type', 'thread_length',
+        'salesRounding'
+    ]
+    # Merge required/enrichment/segmentation fields BEFORE pivot
+    if segmentation_df is not None and "ProductNumber" in segmentation_df.columns:
+        # Prepare mapping for all required fields
+        required_fields_present = [f for f in REQUIRED_EXPORT_FIELDS if f in segmentation_df.columns and f != "ProductNumber"]
+        if required_fields_present or "ProductNumber" in segmentation_df.columns:
+            # Ensure ProductNumber exists and is string
+            if "ProductNumber" not in segmentation_df.columns:
+                raise KeyError("ProductNumber column missing in segmentation_df.")
+            required_map = segmentation_df[["ProductNumber"] + required_fields_present].drop_duplicates()
+            required_map["ProductNumber"] = required_map["ProductNumber"].apply(lambda x: str(x).strip() if pd.notnull(x) else "")
+            df_year["ProductNumber"] = df_year["ProductNumber"].apply(lambda x: str(x).strip() if pd.notnull(x) else "")
+            df_year = df_year.merge(required_map, on="ProductNumber", how="left")
+        # Prepare segmentation mapping
+        if segmentation_col and segmentation_col in segmentation_df.columns:
+            seg_map = segmentation_df[["ProductNumber", segmentation_col]].drop_duplicates()
+            seg_map["ProductNumber"] = seg_map["ProductNumber"].astype(str).str.strip()
+            if segmentation_col not in df_year.columns:
+                df_year = df_year.merge(seg_map, on="ProductNumber", how="left")
+
+    # Remove duplicate ProductNumber columns after merge (keep first)
+    prod_cols = [col for col in df_year.columns if col.startswith("ProductNumber")]
+    if len(prod_cols) > 1:
+        keep_col = "ProductNumber" if "ProductNumber" in prod_cols else prod_cols[0]
+        for col in prod_cols:
+            if col != keep_col:
+                df_year = df_year.drop(columns=[col])
+
+    # Now define all variables for pivot and export
+    year_cols = None
+    rename_map = None
+    year_cols_str = None
+    combined_map = None
+    combined_year_cols = None
+    written = []
+
+
+    # Only one clean implementation below
     pivot = (
         df_year.pivot_table(
-            index=["Class3", "ProductNumber", "ProductDescription", "salesRounding"],
+            index=["Class3", "ProductNumber"] + [f for f in REQUIRED_EXPORT_FIELDS if f in df_year.columns and f != "ProductNumber"] + ([segmentation_col] if segmentation_col and segmentation_col in df_year.columns else []),
             columns="Year",
             values="PurchaseQuantity",
             aggfunc="sum",
@@ -80,83 +126,35 @@ def export_year_split_purchase_quantity(bq,
         ).reset_index()
     )
     pivot.columns.name = None
-    # Deduplicate products within Class3 (keep first description)
-    dup_mask = pivot.duplicated(subset=["Class3", "ProductNumber"], keep="first")
-    if dup_mask.any():
-        removed = int(dup_mask.sum())
-        pivot = pivot[~dup_mask].copy()
-        print(f"Removed {removed} duplicate product rows caused by varying ProductDescription.")
+    pivot = pivot.drop_duplicates(subset=["ProductNumber"], keep="first").copy()
 
     year_cols = [c for c in pivot.columns if isinstance(c, (int, np.integer))]
     year_cols = sorted(year_cols)
     rename_map = {c: str(c) for c in year_cols}
     pivot = pivot.rename(columns=rename_map)
     year_cols_str = [rename_map[c] for c in year_cols]
-    # Combine header label + year into single column names e.g. PurchaseQuantity.2021
     combined_map = {yc: f"{merged_header_label}.{yc}" for yc in year_cols_str}
     pivot = pivot.rename(columns=combined_map)
     combined_year_cols = [combined_map[yc] for yc in year_cols_str]
 
     written: List[str] = []
-    # Prepare segmentation and enrichment mapping if provided
-    seg_map = None
-    enrichment_map = None
-    ENRICHMENT_FIELDS = [
-        'head_shape', 'thread_type', 'head_height', 'head_outside_diameter_width', 'quality',
-        'surface_treatment', 'material', 'din_standard', 'weight_per_100_pcs', 'content_in_sales_unit',
-        'thread_diameter', 'length', 'height', 'total_height', 'width', 'iso_standard', 'inside_diameter',
-        'outside_diameter', 'thickness', 'designed_for_thread', 'total_length', 'head_type', 'thread_length'
-    ]
-    if segmentation_df is not None and "ProductNumber" in segmentation_df.columns:
-        # Prepare segmentation mapping
-        if segmentation_col and segmentation_col in segmentation_df.columns:
-            try:
-                seg_map = (segmentation_df[["ProductNumber", segmentation_col]]
-                           .drop_duplicates()
-                           .assign(ProductNumber=lambda d: d["ProductNumber"].astype(str).str.strip()))
-            except Exception:
-                seg_map = None
-        # Prepare enrichment mapping
-        enrichment_fields_present = [f for f in ENRICHMENT_FIELDS if f in segmentation_df.columns]
-        if enrichment_fields_present:
-            try:
-                enrichment_map = (segmentation_df[["ProductNumber"] + enrichment_fields_present]
-                                  .drop_duplicates()
-                                  .assign(ProductNumber=lambda d: d["ProductNumber"].astype(str).str.strip()))
-            except Exception:
-                enrichment_map = None
-    # Merge enrichment fields into pivot before export
-    if enrichment_map is not None:
-        pivot = pivot.merge(enrichment_map, on="ProductNumber", how="left")
-    # Merge segmentation column if not present
-    if seg_map is not None and segmentation_col and segmentation_col not in pivot.columns:
-        pivot = pivot.merge(seg_map, on="ProductNumber", how="left")
     for c3, group in pivot.groupby("Class3"):
-        # Start with required columns
-        base_cols = ["ProductNumber", "ProductDescription", "salesRounding"]
-        # Add segmentation if available and present in group
+        base_cols = [f for f in REQUIRED_EXPORT_FIELDS if f in group.columns]
         if segmentation_col and segmentation_col in group.columns:
             base_cols.append(segmentation_col)
-        # Add enrichment fields if present in group
-        enrichment_present = [f for f in ENRICHMENT_FIELDS if f in group.columns]
-        # Final columns: base + enrichment + year cols
-        export_cols = base_cols + enrichment_present + combined_year_cols
-        # Only include columns that exist in the group
+        export_cols = base_cols + combined_year_cols
         export_cols = [col for col in export_cols if col in group.columns]
         sub = group[export_cols].copy()
-        # enforce integers for year columns
         for yc in combined_year_cols:
             if yc in sub.columns:
                 sub[yc] = pd.to_numeric(sub[yc], errors="coerce").fillna(0).round(0).astype(int)
+        sub = sub.drop_duplicates(subset=["ProductNumber"], keep="first").copy()
         fname = safe_filename(f"ABC_Segmentation_{c3}_years") + ".xlsx"
         path = os.path.join(output_dir, fname)
-
-        # Write single header row with combined column names
         try:
             try:
                 import xlsxwriter  # noqa: F401
             except ModuleNotFoundError:
-                # Attempt lightweight install (non-fatal)
                 import sys, subprocess
                 try:
                     subprocess.check_call([sys.executable, "-m", "pip", "install", "xlsxwriter"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -168,7 +166,6 @@ def export_year_split_purchase_quantity(bq,
                 workbook = writer.book
                 worksheet = writer.sheets["Sheet1"]
                 qty_fmt = workbook.add_format({"num_format": "#,##0"}) if fmt_thousands else None
-                # Apply number format to each combined year column
                 for col_idx, col_name in enumerate(sub.columns):
                     if col_name in combined_year_cols and qty_fmt is not None:
                         worksheet.set_column(col_idx, col_idx, 12, qty_fmt)
@@ -182,8 +179,4 @@ def export_year_split_purchase_quantity(bq,
             written.append(path)
         print(f"✅ Exported {path} ({len(sub)} rows) - year columns: {', '.join(combined_year_cols)}")
 
-    if not written:
-        print("No per-Class3 exports produced.")
-    else:
-        print("Finished year-split exports.")
-    return written
+
