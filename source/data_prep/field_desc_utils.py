@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+
 """
 Field preparation module for spend analysis
 
@@ -42,28 +44,23 @@ def preprocess_field_name(text):
     
     Example: crm_main_group_vendor -> Group Vendor
     Example: year_authorization -> Year
-    Example: purchase_amaunt_eur -> Purchase Amount Eur
+    Example: purchase_amount_eur -> Purchase Amount Eur
     """
-    # Remove common prefixes
-    prefixes = ['crm_main_', 'year_', 'purchase_', 'amount_']
-    for prefix in prefixes:
-        if text.startswith(prefix):
-            text = text[len(prefix):]
-            break
-
-    # Replace underscores with spaces
-    text = text.replace('_', ' ')
+    # Replace underscores with spaces, but preserve numbers
+    import re
+    text = re.sub(r'_+', ' ', text)
 
     # Tokenize and remove stopwords (fallback if NLTK unavailable)
-    tokens = word_tokenize(text)
+    # Preserve tokens with numbers (e.g., 'Class3')
+    tokens = re.findall(r'[A-Za-z]+\d*|\d+', text)
     try:
         stop_words = set(stopwords.words('english')) if _NLTK_AVAILABLE else set()
     except Exception:
         stop_words = set()
     filtered_tokens = [word for word in tokens if word.lower() not in stop_words]
 
-    # Capitalize each word
-    processed_text = ' '.join(word.capitalize() for word in filtered_tokens)
+    # Capitalize each word, preserve numbers
+    processed_text = ' '.join(word[0].upper() + word[1:] if word else '' for word in filtered_tokens)
 
     return processed_text
 
@@ -93,17 +90,30 @@ def harmonize_field_names(df, threshold=0.8):
     columns = df.columns.tolist()
     to_merge = defaultdict(list)
 
-    for i in range(len(columns)):
-        for j in range(i + 1, len(columns)):
-            if similar(columns[i], columns[j]) > threshold:
-                to_merge[columns[i]].append(columns[j])
+    # Only consider columns with unique names for merging
+    col_counts = pd.Series(columns).value_counts()
+    unique_columns = [col for col in columns if col_counts[col] == 1]
+
+    import re
+    class_pattern = re.compile(r"^Class\d+$", re.IGNORECASE)
+    for i in range(len(unique_columns)):
+        for j in range(i + 1, len(unique_columns)):
+            # Never merge columns named 'Class' followed by a digit (e.g., Class2, Class3, Class4)
+            if class_pattern.match(unique_columns[i]) or class_pattern.match(unique_columns[j]):
+                continue
+            if similar(unique_columns[i], unique_columns[j]) > threshold:
+                to_merge[unique_columns[i]].append(unique_columns[j])
 
     for main_col, similar_cols in to_merge.items():
         for col in similar_cols:
             if col in df.columns:
-                df[main_col] = df[main_col].combine_first(df[col])
-                df.drop(columns=[col], inplace=True)
-
+                # Only merge if both are Series (not DataFrame)
+                if isinstance(df[main_col], pd.Series) and isinstance(df[col], pd.Series):
+                    df[main_col] = df[main_col].combine_first(df[col])
+                    df.drop(columns=[col], inplace=True)
+                else:
+                    # Skip if either is a DataFrame (still duplicate columns)
+                    print(f"[harmonize_field_names] Skipping merge for '{main_col}' and '{col}' due to duplicate columns.")
     return df
 def prepare_field_names(df):
     """Prepare and harmonize field names in the dataframe.

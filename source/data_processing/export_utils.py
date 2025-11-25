@@ -7,7 +7,18 @@ import pandas as pd
 
 from .formatting_utils import safe_filename, write_excel_with_thousands
 
-__all__ = ["export_year_split_purchase_quantity", "fetch_year_purchase_quantity"]
+
+def export_to_excel(sheets: dict, output_path: str):
+    """Write multiple DataFrames to an Excel file, one per sheet."""
+    import pandas as pd
+    with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
+        for sheet_name, df in sheets.items():
+            # Sheet names must be <= 31 chars and not contain special chars
+            safe_sheet = str(sheet_name)[:31].replace(':', '_').replace('/', '_')
+            df.to_excel(writer, sheet_name=safe_sheet, index=False)
+    print(f"[export_to_excel] Wrote {len(sheets)} sheets to {output_path}")
+
+__all__ = ["export_year_split_purchase_quantity", "fetch_year_purchase_quantity", "export_to_excel"]
 
 YEAR_QTY_QUERY_TEMPLATE = """
 SELECT
