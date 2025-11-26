@@ -29,13 +29,13 @@ __all__ = [
 # ----------------------------------------------------------------------
 # BigQuery query template for year-level PurchaseQuantity per product
 # Uses RAW column names from the BigQuery table and aliases to:
-#   ProductNumber, ProductDescription, Class3, Year, PurchaseQuantity
+#   ProductNumber, ProductDescription, class4, Year, PurchaseQuantity
 # ----------------------------------------------------------------------
 YEAR_QTY_QUERY_TEMPLATE = """
 SELECT
     ProductNumber,
     ANY_VALUE(ProductDescription) AS ProductDescription,
-    class3 AS Class3,
+    class4 AS class4,
     CASE
         WHEN REGEXP_CONTAINS(CAST(year_authorization AS STRING), r'^[0-9]{{4}}$')
             THEN CAST(year_authorization AS INT64)
@@ -46,7 +46,7 @@ SELECT
     SUM(purchase_quantity) AS PurchaseQuantity
 FROM `{table}`
 {where_clause}
-GROUP BY ProductNumber, Class3, Year
+GROUP BY ProductNumber, class4, Year
 ORDER BY ProductNumber, Year
 """
 
@@ -59,7 +59,7 @@ def fetch_year_purchase_quantity(
     Fetch year-level purchase quantity per ProductNumber from BigQuery.
 
     Returns columns:
-        ProductNumber, ProductDescription, Class3, Year, PurchaseQuantity
+        ProductNumber, ProductDescription, class4, Year, PurchaseQuantity
     """
     where_clause = ""
     query = YEAR_QTY_QUERY_TEMPLATE.format(table=table, where_clause=where_clause)
@@ -81,14 +81,14 @@ def export_year_split_purchase_quantity(
     segmentation_col: str = "Segmentation",
 ) -> List[str]:
     """
-    Export per-Class3 Excel files with year-split PurchaseQuantity.
+    Export per-class4 Excel files with year-split PurchaseQuantity.
 
     Logic:
       1. Fetch year-level quantities per ProductNumber from BigQuery.
       2. Pivot to wide format: one row per ProductNumber, columns PurchaseQuantity.YYYY.
       3. Merge enrichment (Segmentation + tech fields) from segmentation_df on ProductNumber.
-      4. Merge Class3 from BigQuery (one Class3 per ProductNumber).
-      5. Export one Excel per Class3 with:
+      4. Merge class4 from BigQuery (one class4 per ProductNumber).
+      5. Export one Excel per class4 with:
 
          ProductNumber, ProductDescription, Segmentation, SalesRounding,
          Year Authorization, Din Standard, Iso Standard, Quality, Material,
@@ -135,9 +135,9 @@ def export_year_split_purchase_quantity(
     pivot = pivot.rename(columns=rename_years)
     year_cols_renamed = list(rename_years.values())
 
-    # 3) Build Class3 map: one Class3 per ProductNumber from df_year
-    class3_map = (
-        df_year[["ProductNumber", "Class3"]]
+    # 3) Build class4 map: one class4 per ProductNumber from df_year
+    class4_map = (
+        df_year[["ProductNumber", "class4"]]
         .drop_duplicates(subset=["ProductNumber"])
     )
 
@@ -152,10 +152,10 @@ def export_year_split_purchase_quantity(
     else:
         merged = pivot.copy()
 
-    # 5) Merge Class3 onto merged
-    class3_map["ProductNumber"] = class3_map["ProductNumber"].astype(str).str.strip()
+    # 5) Merge class4 onto merged
+    class4_map["ProductNumber"] = class4_map["ProductNumber"].astype(str).str.strip()
     merged["ProductNumber"] = merged["ProductNumber"].astype(str).str.strip()
-    merged = merged.merge(class3_map, on="ProductNumber", how="left")
+    merged = merged.merge(class4_map, on="ProductNumber", how="left")
 
     # 6) Define the static columns to export (pretty names)
     static_cols = [
@@ -163,37 +163,17 @@ def export_year_split_purchase_quantity(
         "ProductDescription",
         segmentation_col,
         "SalesRounding",
-        "Din Standard",
-        "Iso Standard",
-        "Quality",
-        "Material",
-        "Surface Treatment",
-        "Head Shape",
-        "Thread Type",
-        "Head Height",
-        "Head Outside Diameter Width",
-        "Thread Diameter",
-        "Length",
-        "Height",
-        "Total Height",
-        "Width",
-        "Inside Diameter",
-        "Outside Diameter",
-        "Thickness",
-        "Designed For Thread",
-        "Total Length",
-        "Head Type",
-        "Thread Length",
+       
     ]
 
-    # 7) Export per Class3
+    # 7) Export per class4
     written: List[str] = []
 
-    if "Class3" not in merged.columns:
-        print("No Class3 column after merge; nothing exported.")
+    if "class4" not in merged.columns:
+        print("No class4 column after merge; nothing exported.")
         return []
 
-    for c3, group in merged.groupby("Class3"):
+    for c3, group in merged.groupby("class4"):
         # Keep only static columns that exist + year columns
         export_cols = [c for c in static_cols if c in group.columns] + year_cols_renamed
         export_cols = [c for c in export_cols if c in group.columns]

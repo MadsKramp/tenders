@@ -34,7 +34,7 @@ __all__ = [
     'preprocess_detailed_data',
     'make_spend_col',
     'compute_abc_tiers',
-    'fetch_purchase_data_enriched',
+    'fetch_purchase_data',
     # add other public functions as needed
 ]
 # ---------------------------------------------------------------------------
@@ -151,9 +151,9 @@ PROJECT_ID = os.getenv('PROJECT_ID')
 DATASET_ID = os.getenv('DATASET_ID')
 TABLE_ID = os.getenv('TABLE_ID')
 if PROJECT_ID and DATASET_ID and TABLE_ID:
-    PURCHASE_DATA_ENRICHED_TABLE = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+    PURCHASE_DATA_TABLE = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
 else:
-    PURCHASE_DATA_ENRICHED_TABLE = None
+    PURCHASE_DATA_TABLE = None
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -245,7 +245,7 @@ def _safe_apply_prepare_field_names(df: pd.DataFrame) -> pd.DataFrame:
 # Data fetching (optional)
 # ---------------------------------------------------------------------------
 
-def fetch_purchase_data_enriched(bq_client: 'BigQueryConnector', limit: Optional[int] = None) -> pd.DataFrame:
+def fetch_purchase_data(bq_client: 'BigQueryConnector', limit: Optional[int] = None) -> pd.DataFrame:
     # Lazy import in case initial module import failed (e.g., due to transient encoding issues)
     global BigQueryConnector, get_query
     if BigQueryConnector is None or get_query is None:
@@ -256,10 +256,10 @@ def fetch_purchase_data_enriched(bq_client: 'BigQueryConnector', limit: Optional
             get_query = _get_query
         except Exception as e:
             raise ImportError(f"BigQuery dependencies not available after lazy import attempt: {e}")
-    if not PURCHASE_DATA_ENRICHED_TABLE:
+    if not PURCHASE_DATA_TABLE:
         raise EnvironmentError("PROJECT_ID/DATASET_ID/TABLE_ID env vars are not set.")
     print("Fetching purchase data from BigQuery...")
-    query = get_query('fetch_purchase_data_enriched').format(purchase_data_enriched_table=PURCHASE_DATA_ENRICHED_TABLE)
+    query = get_query('fetch_purchase_data').format(purchase_data_table=PURCHASE_DATA_TABLE)
     if limit is not None:
         query += f" LIMIT {limit}"
     df = bq_client.query(query)
@@ -294,7 +294,7 @@ def preprocess_detailed_data(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-def compute_abcde_per_class3(
+def compute_abcde_per_class4(
     df,
     class_col,
     product_col,
@@ -394,11 +394,11 @@ __all__ = [
     'fmt_eur','parse_eur','is_valid_eur_format','add_eur_suffix','fmt_units','parse_units','is_valid_units_format',
     'preprocess_field_values','harmonize_field_values','prepare_field_values',
     # Fetch & preprocess
-    'fetch_purchase_data_enriched','preprocess_detailed_data',
+    'fetch_purchase_data','preprocess_detailed_data',
     # Tiering
     'compute_abc_tiers','compute_kmeans_tiers','compute_gmm_tiers','summarize_tiers',
     # Analyses / viz
-    'create_dashboard_distributions','create_class3_countryoforigin_relationship_dashboard',
+    'create_dashboard_distributions','create_class4_countryoforigin_relationship_dashboard',
     'analyze_spend_by_group_vendor','analyze_spend_trends_by_group_vendor_and_countryoforigin',
     'analyze_spend_by_productnumber','abc_segmentation_analysis',
     'analyze_spend_distribution','analyze_supplier_distribution','analyze_purchase_frequency',

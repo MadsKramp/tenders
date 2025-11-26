@@ -296,13 +296,13 @@ def quick_query(sql: str, project_id: Optional[str] = None) -> Optional[pd.DataF
         _safe_print(f"Error in quick_query: {e}")
         return None
 
-def get_kramp_purchase_data_enriched(limit: int = 1000) -> Optional[pd.DataFrame]:
+def get_kramp_purchase_data(limit: int = 1000) -> Optional[pd.DataFrame]:
     try:
         _safe_print(f"Getting Kramp purchase data (limit={limit})...")
-        sql = f"SELECT * FROM `kramp-sharedmasterdata-prd.MadsH.purchase_data_enriched` LIMIT {limit}"
+        sql = f"SELECT * FROM `kramp-sharedmasterdata-prd.MadsH.purchase_data` LIMIT {limit}"
         return quick_query(sql)
     except Exception as e:
-        _safe_print(f"Error in get_kramp_purchase_data_enriched: {e}")
+        _safe_print(f"Error in get_kramp_purchase_data: {e}")
         return None
 
 

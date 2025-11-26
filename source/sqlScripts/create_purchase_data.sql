@@ -81,12 +81,7 @@ JOIN (
   FROM `kramp-purchase-prd.kramp_purchase_customquery.CUQ__TBL__DataDive__Purchase`
 ) AS p
   ON CAST(p.ProductNumber AS STRING) = CAST(b.kramp_item_number AS STRING)
-WHERE p.class2_code = '54'
-  AND p.PLMStatusGlobal NOT IN (
-    '600 - Phasing out phase in progress',
-    '700 - Phased out phase in progress',
-    '750 - Phased out phase completed'
-  );
+WHERE p.class2_code = '54';
 
 -- Purchase stop status per product (active vs stopped)
 CREATE TEMP TABLE products_purchasestop AS
