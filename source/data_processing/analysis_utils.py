@@ -384,72 +384,6 @@ def analyze_purchase_frequency(df: pd.DataFrame, purchase_col: str = 'Purchase Q
     plt.tight_layout(); plt.show()
     print(vals.describe())
 
-# ---------------------------------------------------------------------------
-# Export
-# ---------------------------------------------------------------------------
-"""
-Function to export segmentation results by Class3 as .xlsx unsing source.data_processing.export_utils, with PurchaseQuantity by
-year as example PurchaseQuantity.2021.
-Includes columns: ProductNumber, ProductDescription, salesRounding, head_shape,
-thread_type, head_height, head_outside_diameter_width, quality, surface_treament,
-material, din_standard, thread_diameter, length, height, total_height,
-width, iso_standard, inside_diameter, outside_diameter, thickness,
-designed_for_thread, total_length, head_type, thread_length.
-"""
-def export_results_per_class3(
-    df: pd.DataFrame,
-    output_path: str,
-    purchase_quantity_years: list[int] = None,
-    class3_col: str = 'class3',
-    product_number_col: str = 'ProductNumber',
-    product_description_col: str = 'ProductDescription'
-) -> None:
-    """
-    Export segmentation results by Class3 as .xlsx using source.data_processing.export_utils.
-    Includes PurchaseQuantity by year as columns (e.g., PurchaseQuantity.2021).
-    """
-    try:
-        from source.data_processing.export_utils import export_to_excel
-    except ImportError:
-        raise ImportError("export_utils not found. Please ensure it is available on PYTHONPATH.")
-
-    # Robustly resolve class3 column
-    resolved_class3_col = _resolve_col(df, [class3_col, 'Class3', 'class3', 'Class 3'])
-    print(f"[export_results_per_class3] Using class3 column: '{resolved_class3_col}' (input was '{class3_col}')")
-
-    if resolved_class3_col not in df.columns:
-        raise ValueError(f"Class3 column '{resolved_class3_col}' not found in DataFrame columns: {list(df.columns)}")
-    if not any(df[resolved_class3_col].notnull()):
-        print(f"[export_results_per_class3] Warning: All values in '{resolved_class3_col}' are null or empty.")
-
-    # Ensure all required columns are present in the export, fill missing with NaN
-    required_cols = [
-        product_number_col, product_description_col, resolved_class3_col, "Segmentation",
-        "salesRounding", "year_authorization", 'Purchase Amount Eur',
-        "head_shape","thread_type","head_height","head_outside_diameter_width","quality",
-        "surface_treatment","material","din_standard","thread_diameter","length","height",
-        "total_height","width","iso_standard","inside_diameter","outside_diameter",
-        "thickness","designed_for_thread","total_length","head_type","thread_length"
-    ]
-    # Try with _x suffixes as well
-    cols_with_x = []
-    for col in required_cols:
-        if col in df.columns:
-            cols_with_x.append(col)
-        elif col+"_x" in df.columns:
-            cols_with_x.append(col+"_x")
-        else:
-            cols_with_x.append(col)  # will be filled with NaN
-    # Add missing columns as NaN
-    for col in cols_with_x:
-        if col not in df.columns:
-            df[col] = np.nan
-    export_df = df[cols_with_x]
-    grouped = export_df.groupby(resolved_class3_col)
-    sheets = {str(class3): group for class3, group in grouped}
-    export_to_excel(sheets, output_path)
-    print(f"Exported segmentation results per {resolved_class3_col} to {output_path}")
-    
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -468,7 +402,5 @@ __all__ = [
     'analyze_spend_by_group_vendor','analyze_spend_trends_by_group_vendor_and_countryoforigin',
     'analyze_spend_by_productnumber','abc_segmentation_analysis',
     'analyze_spend_distribution','analyze_supplier_distribution','analyze_purchase_frequency',
-    # Export
-    'export_results_per_class3',
-    'summarize_tiers',
+    
 ]
