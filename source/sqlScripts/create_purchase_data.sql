@@ -1,13 +1,14 @@
--- Check brand filter, default is 'Kramp'
--- Check level2 filter below, default is 'Threaded Fasteners'
+-- Check brand filter, default is 'Kramp'.
+-- Check class4 filter below.
 
 -- Clean target
 CREATE SCHEMA IF NOT EXISTS `kramp-sharedmasterdata-prd.MadsH`;
 DROP TABLE IF EXISTS `kramp-sharedmasterdata-prd.MadsH.purchase_data`;
 
--- First temp table: purchase rows (class2 code 54, post-2020, has main group vendor)
-CREATE TEMP TABLE purchase_data AS
-WITH src AS (
+-- Final table: all logic via CTEs, no extra temp tables
+CREATE TABLE `kramp-sharedmasterdata-prd.MadsH.purchase_data` AS
+WITH purchase_data AS (
+  -- Purchase rows (class2 code 54, post-2020, has main group vendor)
   SELECT
     year_authorization,
     uniquevendorcode,
@@ -57,58 +58,49 @@ WITH src AS (
     EAN_code,
     cn_code,
     contract_type,
-    -- normalize class2 to a pure code like '54'
     REGEXP_EXTRACT(class2, r'^\s*(\d+)') AS class2_code
   FROM `kramp-purchase-prd.kramp_purchase_customquery.CUQ__TBL__DataDive__Purchase`
-)
-SELECT *
-FROM src
-WHERE crm_main_group_vendor IS NOT NULL
-  AND year_authorization > 2020
-  AND class2_code = '54';
+  WHERE crm_main_group_vendor IS NOT NULL
+    AND year_authorization > 2020
+    AND REGEXP_EXTRACT(class2, r'^\s*(\d+)') = '54'
+),
 
--- Second temp table: brand mapping for only class2=54 and allowed PLM statuses
-CREATE TEMP TABLE brand_table AS
-SELECT DISTINCT
-  b.kramp_item_number AS ProductNumber,
-  b.key_brand_identifier
-FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__REL__productBrand__current` AS b
-JOIN (
+brand_table AS (
+  -- Brand mapping only for products that appear in purchase_data (class2=54)
+  SELECT DISTINCT
+    b.kramp_item_number AS ProductNumber,
+    b.key_brand_identifier
+  FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__REL__productBrand__current` AS b
+  JOIN purchase_data AS p
+    ON CAST(p.ProductNumber AS STRING) = CAST(b.kramp_item_number AS STRING)
+),
+
+products_purchasestop AS (
+  -- Purchase stop status per product (active vs stopped)
+  SELECT
+    b.ProductNumber,
+    CASE
+      WHEN MAX(a.PurchaseStopInd) = MIN(a.PurchaseStopInd) THEN MAX(a.PurchaseStopInd)
+      ELSE MIN(a.PurchaseStopInd)
+    END AS PurchaseStopInd
+  FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__REL__companyProduct__current` a
+  LEFT JOIN `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__DIM__product__current` b
+    ON a.ProductId = b.ProductId
+  LEFT JOIN `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__DIM__company__current` c
+    ON a.CompanyId = c.CompanyId
+  WHERE c.CompanyShortDescription LIKE 'Kramp %'
+  GROUP BY b.ProductNumber
+),
+
+sales_rounding AS (
+  -- Sales rounding per ProductNumber (deduped)
   SELECT
     ProductNumber,
-    PLMStatusGlobal,
-    REGEXP_EXTRACT(class2, r'^\s*(\d+)') AS class2_code
-  FROM `kramp-purchase-prd.kramp_purchase_customquery.CUQ__TBL__DataDive__Purchase`
-) AS p
-  ON CAST(p.ProductNumber AS STRING) = CAST(b.kramp_item_number AS STRING)
-WHERE p.class2_code = '54';
+    ANY_VALUE(salesRounding) AS salesRounding
+  FROM `kramp-sales-prd.kramp_sales_customquery.CUQ__TBL__externalSales_enriched`
+  GROUP BY ProductNumber
+)
 
--- Purchase stop status per product (active vs stopped)
-CREATE TEMP TABLE products_purchasestop AS
-SELECT
-  b.ProductNumber,
-  CASE
-    WHEN MAX(a.PurchaseStopInd) = MIN(a.PurchaseStopInd) THEN MAX(a.PurchaseStopInd)
-    ELSE MIN(a.PurchaseStopInd)
-  END AS PurchaseStopInd
-FROM `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__REL__companyProduct__current` a
-LEFT JOIN `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__DIM__product__current` b
-  ON a.ProductId = b.ProductId
-LEFT JOIN `kramp-sharedmasterdata-prd.kramp_sharedmasterdata_presentation.PRES__DIM__company__current` c
-  ON a.CompanyId = c.CompanyId
-WHERE c.CompanyShortDescription LIKE 'Kramp %'
-GROUP BY b.ProductNumber;
-
--- Sales rounding per ProductNumber (deduped)
-CREATE TEMP TABLE sales_rounding AS
-SELECT
-  ProductNumber,
-  ANY_VALUE(salesRounding) AS salesRounding
-FROM `kramp-sales-prd.kramp_sales_customquery.CUQ__TBL__externalSales_enriched`
-GROUP BY ProductNumber;
-
--- Final table: only class2=54 rows, brand identifier, purchase-stop active, brand/level2 filters, + salesRounding
-CREATE TABLE `kramp-sharedmasterdata-prd.MadsH.purchase_data` AS
 SELECT
   pd.year_authorization,
   pd.uniquevendorcode,
@@ -170,4 +162,31 @@ LEFT JOIN sales_rounding AS sr
   ON CAST(pd.ProductNumber AS STRING) = CAST(sr.ProductNumber AS STRING)
 WHERE ps.PurchaseStopInd = 'N'
   AND LOWER(TRIM(pd.brandName)) = 'kramp'
-  AND LOWER(TRIM(pd.level2)) = 'threaded fasteners';
+  AND LOWER(TRIM(pd.class4)) IN (
+    '6905 | bolts & nuts 8.8 metric',
+    '6910 | bolts & nuts 10.9 metric',
+    '6935 | bolts & nuts stainless steel',
+    '6965 | washers',
+    '6952 | threaded rods 8.8 - 10.9',
+    '6900 | bolts & nuts 4.6 metric',
+    '6915 | bolts & nuts 12.9 metric',
+    '6920 | bolts & nuts metric fine',
+    '6945 | bolts & nuts other',
+    '6970 | washers stainless steel',
+    '6944 | metal screws',
+    '6925 | bolts & nuts unc / unf',
+    '6954 | threaded rods stainless steel',
+    '6985 | wood screws',
+    '7008 | shims',
+    '6930 | bolts & nuts hotdip galvanized',
+    '7035 | blind rivets',
+    '6950 | threaded rods 4.6',
+    '6981 | wall fixings stainless steel',
+    '6956 | threaded rods trapizoidal',
+    '6984 | wall fixings other',
+    '7045 | gate hinges',
+    '6940 | bolts & nuts plastic',
+    '7057 | chain & accessories',
+    '7020 | hose clamps & accorries',
+    '7005 | circlips'
+  );
