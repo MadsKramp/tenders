@@ -189,4 +189,5 @@ WHERE ps.PurchaseStopInd = 'N'
     '7057 | chain & accessories',
     '7020 | hose clamps & accorries',
     '7005 | circlips'
-  );
+  )
+  AND NOT REGEXP_CONTAINS(CAST(pd.ProductNumber AS STRING), r'P001$');
