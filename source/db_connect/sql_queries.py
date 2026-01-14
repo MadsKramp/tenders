@@ -241,6 +241,7 @@ GROUP BY product_id;
 FETCH_PURCHASE_DATA_SQL = """
 -- Aggregate purchase metrics per product
 SELECT
+year_authorization,
   ProductNumber,
   ProductDescription,
   crm_main_vendor,
