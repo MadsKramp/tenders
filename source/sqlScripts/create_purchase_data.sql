@@ -177,17 +177,10 @@ WHERE ps.PurchaseStopInd = 'N'
     '6925 | bolts & nuts unc / unf',
     '6954 | threaded rods stainless steel',
     '6985 | wood screws',
-    '7008 | shims',
     '6930 | bolts & nuts hotdip galvanized',
-    '7035 | blind rivets',
     '6950 | threaded rods 4.6',
     '6981 | wall fixings stainless steel',
     '6956 | threaded rods trapizoidal',
     '6984 | wall fixings other',
-    '7045 | gate hinges',
-    '6940 | bolts & nuts plastic',
-    '7057 | chain & accessories',
-    '7020 | hose clamps & accorries',
-    '7005 | circlips'
-  )
+    )
   AND NOT REGEXP_CONTAINS(CAST(pd.ProductNumber AS STRING), r'P001$');

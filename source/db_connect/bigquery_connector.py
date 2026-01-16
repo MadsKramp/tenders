@@ -299,7 +299,32 @@ def quick_query(sql: str, project_id: Optional[str] = None) -> Optional[pd.DataF
 def get_kramp_purchase_data(limit: int = 1000) -> Optional[pd.DataFrame]:
     try:
         _safe_print(f"Getting Kramp purchase data (limit={limit})...")
-        sql = f"SELECT * FROM `kramp-sharedmasterdata-prd.MadsH.purchase_data` LIMIT {limit}"
+        sql = f"""
+        SELECT * FROM `kramp-sharedmasterdata-prd.MadsH.purchase_data`
+        WHERE LOWER(TRIM(class4)) IN (
+            '6905 | bolts & nuts 8.8 metric',
+            '6910 | bolts & nuts 10.9 metric',
+            '6935 | bolts & nuts stainless steel',
+            '6965 | washers',
+            '6952 | threaded rods 8.8 - 10.9',
+            '6900 | bolts & nuts 4.6 metric',
+            '6915 | bolts & nuts 12.9 metric',
+            '6920 | bolts & nuts metric fine',
+            '6945 | bolts & nuts other',
+            '6970 | washers stainless steel',
+            '6944 | metal screws',
+            '6925 | bolts & nuts unc / unf',
+            '6954 | threaded rods stainless steel',
+            '6985 | wood screws',
+            '7008 | shims',
+            '6930 | bolts & nuts hotdip galvanized',
+            '6950 | threaded rods 4.6',
+            '6981 | wall fixings stainless steel',
+            '6956 | threaded rods trapizoidal',
+            '6984 | wall fixings other'
+        )
+        LIMIT {limit}
+        """
         return quick_query(sql)
     except Exception as e:
         _safe_print(f"Error in get_kramp_purchase_data: {e}")

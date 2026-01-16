@@ -189,17 +189,11 @@ WHERE ps.PurchaseStopInd = 'N'
     '6985 | wood screws',
     '7008 | shims',
     '6930 | bolts & nuts hotdip galvanized',
-    '7035 | blind rivets',
     '6950 | threaded rods 4.6',
     '6981 | wall fixings stainless steel',
     '6956 | threaded rods trapizoidal',
     '6984 | wall fixings other',
-    '7045 | gate hinges',
-    '6940 | bolts & nuts plastic',
-    '7057 | chain & accessories',
-    '7020 | hose clamps & accorries',
-    '7005 | circlips'
-  );
+);
 
 """
 
@@ -241,7 +235,7 @@ GROUP BY product_id;
 FETCH_PURCHASE_DATA_SQL = """
 -- Aggregate purchase metrics per product
 SELECT
-year_authorization,
+  year_authorization,
   ProductNumber,
   ProductDescription,
   crm_main_vendor,
@@ -256,7 +250,29 @@ year_authorization,
   SUM(purchase_amount_eur) AS purchase_amount_eur,
   SUM(purchase_quantity)   AS purchase_quantity
 FROM `{purchase_data_table}`
-GROUP BY ProductNumber, ProductDescription, crm_main_vendor, crm_main_group_vendor,
+WHERE LOWER(TRIM(class4)) IN (
+    '6905 | bolts & nuts 8.8 metric',
+    '6910 | bolts & nuts 10.9 metric',
+    '6935 | bolts & nuts stainless steel',
+    '6965 | washers',
+    '6952 | threaded rods 8.8 - 10.9',
+    '6900 | bolts & nuts 4.6 metric',
+    '6915 | bolts & nuts 12.9 metric',
+    '6920 | bolts & nuts metric fine',
+    '6945 | bolts & nuts other',
+    '6970 | washers stainless steel',
+    '6944 | metal screws',
+    '6925 | bolts & nuts unc / unf',
+    '6954 | threaded rods stainless steel',
+    '6985 | wood screws',
+    '7008 | shims',
+    '6930 | bolts & nuts hotdip galvanized',
+    '6950 | threaded rods 4.6',
+    '6981 | wall fixings stainless steel',
+    '6956 | threaded rods trapizoidal',
+    '6984 | wall fixings other'
+)
+GROUP BY year_authorization, ProductNumber, ProductDescription, crm_main_vendor, crm_main_group_vendor,
          class2, class3, class4, brandName, BrandType, countryOfOrigin, PurchaseStopInd
 ORDER BY purchase_amount_eur DESC;
 """

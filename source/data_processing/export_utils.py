@@ -61,7 +61,30 @@ def fetch_year_purchase_quantity(
     Returns columns:
         ProductNumber, ProductDescription, class4, Year, PurchaseQuantity
     """
-    where_clause = ""
+    where_clause = """
+WHERE LOWER(TRIM(class4)) IN (
+    '6905 | bolts & nuts 8.8 metric',
+    '6910 | bolts & nuts 10.9 metric',
+    '6935 | bolts & nuts stainless steel',
+    '6965 | washers',
+    '6952 | threaded rods 8.8 - 10.9',
+    '6900 | bolts & nuts 4.6 metric',
+    '6915 | bolts & nuts 12.9 metric',
+    '6920 | bolts & nuts metric fine',
+    '6945 | bolts & nuts other',
+    '6970 | washers stainless steel',
+    '6944 | metal screws',
+    '6925 | bolts & nuts unc / unf',
+    '6954 | threaded rods stainless steel',
+    '6985 | wood screws',
+    '7008 | shims',
+    '6930 | bolts & nuts hotdip galvanized',
+    '6950 | threaded rods 4.6',
+    '6981 | wall fixings stainless steel',
+    '6956 | threaded rods trapizoidal',
+    '6984 | wall fixings other'
+)
+"""
     query = YEAR_QTY_QUERY_TEMPLATE.format(table=table, where_clause=where_clause)
     try:
         df_year = bq.query(query)
